@@ -1,0 +1,16 @@
+This project uses third-party Python packages.
+
+Important dependencies include:
+
+- NumPy (BSD-3-Clause)
+- SciPy (BSD-3-Clause)
+- Pandas (BSD-3-Clause)
+- Matplotlib (BSD-style license)
+- PyQt5 (GPL v3.0 or commercial license)
+- PyQt5-Qt5 (Qt licensing terms apply)
+- pyqtgraph (MIT)
+- PySerial (BSD-3-Clause)
+- pylsl (MIT)
+- Nuitka (Apache-2.0)
+
+See package metadata for exact license information and versions.
