@@ -37,7 +37,6 @@ logging.basicConfig(
 def log_print(message: str):
     """
     Print to console and also write to debug log file.
-    In release build without console, the log file still remains useful.
     """
     print(message, flush=True)
     logging.info(message)

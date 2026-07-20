@@ -46,8 +46,7 @@ class MCUThread(QThread):
         # Larger = less sensitive.
         #
         # This is the raw load difference that maps to +1 or -1.
-
-        ## MEGA IMPORTANT !!!!!!!!! DO NOT DELETE: DEFAULT self.LOAD_SPAN = 800.0
+        ## IMPORTANT: DEFAULT self.LOAD_SPAN = 800.0
 
         self.LOAD_SPAN = 1e9
 
@@ -150,8 +149,6 @@ class MCUThread(QThread):
 
                     # Baseline-corrected load.
                     # Same units as Arduino force_g.
-                    # No clamp.
-                    # No normalization.
                     load_out = load - self.load_zero
 
                 self.data.emit(aligned_ts, angle, load_out)

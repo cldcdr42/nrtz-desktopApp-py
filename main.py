@@ -44,9 +44,6 @@ class MainApp(QMainWindow):
         # -------------------------------------------------
         # This affects ONLY the live EMG plot X axis.
         # CSV still receives real synchronized timestamps.
-        #
-        # Your EMG CSV previously showed ~0.001 s spacing,
-        # so 1000 Hz is a reasonable display rate.
         # -------------------------------------------------
         self.emg_plot_fs = 1000.0
         self.emg_plot_sample_index = 0
@@ -251,7 +248,7 @@ class MainApp(QMainWindow):
 
     def open_data_folder(self):
 
-        # Always resolve base data directory via your existing helper
+        # Always resolve base data directory via existing helper
         data_dir = resource_path("data", writable=True)
 
         path = str(data_dir)
@@ -394,9 +391,6 @@ class MainApp(QMainWindow):
         # LSLThread -> self.emg_queue.
         # -------------------------------------------------
 
-        
-
-
         self.t_emg.append(t_rel)
         self.v_emg.append(v)
 
@@ -420,11 +414,6 @@ class MainApp(QMainWindow):
         # -------------------------------------------------
         # Live plot only:
         # Use evenly spaced display time instead of real receive timestamps.
-        #
-        # This fixes the "horizontal lines + vertical sticks" look when LSL
-        # delivers samples in bursts or with uneven receive timestamps.
-        #
-        # This DOES NOT affect CSV timestamps.
         # -------------------------------------------------
         plot_t = self.emg_plot_sample_index / self.emg_plot_fs
         self.emg_plot_sample_index += 1
