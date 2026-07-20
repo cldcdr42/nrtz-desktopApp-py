@@ -1,0 +1,25 @@
+# Virtual environments
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Folder with recorded data
+data/
+
+# Folders for distributed app version
+main.build/
+main.dist
+
+# Folder for Nuitka compiler
+pylsl/
+
+# Windows PS script for building an app
+build.bat
+
+# Folder for temporary files or utilites which are not necessary for the app
+utilities/
+
+# FIle with debug logs
+mcu_debug.log
