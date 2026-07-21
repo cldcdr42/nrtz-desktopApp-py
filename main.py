@@ -159,6 +159,11 @@ class MainApp(QMainWindow):
 
             f.write("Комментарии:\n")
             f.write(self.comment_edit.toPlainText())
+            f.write("\n\n")
+            f.write(
+                f"Session start perf_counter: "
+                f"{self.session_start:.9f}\n"
+            )         
 
         print("\n[SESSION START]")
         print(self.folder)
@@ -302,7 +307,7 @@ class MainApp(QMainWindow):
 
         # IMPORTANT:
         # real samples define session zero
-        self.session_start = local_clock()
+        self.session_start = time.perf_counter()
         self.emg_start_time = None
 
         # Update visible date at recording start
@@ -432,7 +437,7 @@ class MainApp(QMainWindow):
 
         self.mcu_queue.put(
             (
-                pc_time - self.session_start,
+                pc_time,
                 mcu_time_us,
                 angle_raw,
                 a,

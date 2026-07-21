@@ -1,5 +1,4 @@
 from PyQt5.QtCore import QThread, pyqtSignal
-from pylsl import local_clock
 
 import serial
 import serial.tools.list_ports
@@ -53,7 +52,7 @@ def log_exception(message: str):
 
 class MCUThread(QThread):
 
-    # pc_local_clock_timestamp, mcu_time, angle_raw, angle, load_raw, load_norm
+    # pc_perf_timestamp, mcu_time, angle_raw, angle, load_raw, load_norm
     data = pyqtSignal(float, float, float, float, float, float)
 
     # raw JSON line for UDP forwarding
@@ -189,6 +188,9 @@ class MCUThread(QThread):
 
                     continue
 
+                # Timestamp when sample arrived at PC
+                pc_perf_ts = time.perf_counter()
+
                 self.last_line_time = time.monotonic()
 
                 try:
@@ -227,11 +229,6 @@ class MCUThread(QThread):
                 mcu_ts, angle_raw, angle, load = parsed
 
                 # -------------------------------------------------
-                # Timestamp source
-                # -------------------------------------------------
-                aligned_ts = local_clock()
-
-                # -------------------------------------------------
                 # Relative HX711 normalization: -1 to +1
                 # -------------------------------------------------
 
@@ -262,7 +259,7 @@ class MCUThread(QThread):
                 self.valid_count += 1
 
                 self.data.emit(
-                    aligned_ts,
+                    pc_perf_ts,
                     mcu_ts,
                     angle_raw,
                     angle,

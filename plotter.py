@@ -104,19 +104,19 @@ def _load_mcu_csv(path: Path):
             raise ValueError("mcu.csv has no header.")
 
         required = {
-            "pc_timestamp_s",
+            "pc_perf_counter_s",
             "angle_deg",
             "load_norm"
         }
 
         if not required.issubset(set(reader.fieldnames)):
             raise ValueError(
-                "mcu.csv must contain columns: pc_timestamp_s, angle_deg, load_norm"
+                "mcu.csv must contain columns: pc_perf_counter_s, angle_deg, load_norm"
             )
 
         for row in reader:
 
-            t = _to_float(row.get("pc_timestamp_s"))
+            t = _to_float(row.get("pc_perf_counter_s"))
             a = _to_float(row.get("angle_deg"))
             l = _to_float(row.get("load_norm"))
 

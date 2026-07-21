@@ -1,6 +1,7 @@
 from PyQt5.QtCore import QThread, pyqtSignal
-from pylsl import resolve_streams, StreamInlet, local_clock
+from pylsl import resolve_streams, StreamInlet
 import traceback
+import time
 
 
 class LSLThread(QThread):
@@ -22,7 +23,6 @@ class LSLThread(QThread):
         emg_queue,
         session_start_getter=None,
         plot_hz=50.0,
-        use_original_lsl_timestamps=True,
     ):
         super().__init__()
 
@@ -32,8 +32,6 @@ class LSLThread(QThread):
 
         self.plot_hz = float(plot_hz)
         self.plot_interval = 1.0 / self.plot_hz
-
-        self.use_original_lsl_timestamps = use_original_lsl_timestamps
 
         self.running = True
         self.inlet = None
@@ -109,6 +107,7 @@ class LSLThread(QThread):
                     self.msleep(1)
                     continue
 
+
                 latest_t_rel = None
                 latest_value = None
 
@@ -122,10 +121,8 @@ class LSLThread(QThread):
                     except Exception:
                         continue
 
-                    if self.use_original_lsl_timestamps:
-                        sample_ts = float(lsl_ts)
-                    else:
-                        sample_ts = local_clock()
+                    # Keep original LSL sample timestamp
+                    sample_ts = float(lsl_ts)
 
                     # -------------------------------------------------
                     # IMPORTANT:
@@ -142,8 +139,8 @@ class LSLThread(QThread):
                     if t_rel < 0:
                         continue
 
-                    # Full-rate saving
-                    pc_ts = local_clock()
+                    # PC arrival/save timestamp
+                    pc_ts = time.perf_counter()
 
                     self.emg_queue.put(
                         (
@@ -161,7 +158,7 @@ class LSLThread(QThread):
                 # -------------------------------------------------
                 # Emit to GUI only at plot_hz
                 # -------------------------------------------------
-                now = local_clock()
+                now = time.perf_counter()
 
                 if (
                     latest_t_rel is not None

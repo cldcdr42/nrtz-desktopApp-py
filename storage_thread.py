@@ -69,12 +69,12 @@ class StorageThread(QThread):
 
         self.emg_writer.writerow([
             "lsl_timestamp_s",
-            "pc_timestamp_s",
+            "pc_perf_counter_s",
             "relative_time_s",
             "emg"
         ])
         self.mcu_writer.writerow([
-            "pc_timestamp_s",
+            "pc_perf_counter_s",
             "mcu_timestamp_us",
             "angle_raw",
             "angle_deg",
