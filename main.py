@@ -423,20 +423,29 @@ class MainApp(QMainWindow):
 
         self.trim_many(self.t_emg, self.v_emg, max_len=5000)
     """
-    def on_mcu(self, t, a, l):
+    def on_mcu(self, pc_time, mcu_time_us, angle_raw, a, load_raw, load_norm):
 
         if self.session_start is None:
             return
 
-        t_rel = t - self.session_start
+        t_rel = pc_time - self.session_start
 
-        self.mcu_queue.put((t_rel, a, l))
+        self.mcu_queue.put(
+            (
+                pc_time - self.session_start,
+                mcu_time_us,
+                angle_raw,
+                a,
+                load_raw,
+                load_norm
+            )
+        )
 
         self.t_mcu.append(t_rel)
         self.angle.append(a)
-        self.load.append(l)
+        self.load.append(load_norm)
 
-        print(l)
+        #print(load_norm)
         #print(load_norm, "norm")
 
         self.trim_many(self.t_mcu, self.angle, self.load, max_len=5000)

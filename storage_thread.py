@@ -67,9 +67,20 @@ class StorageThread(QThread):
         self.emg_writer = csv.writer(self.emg_file)
         self.mcu_writer = csv.writer(self.mcu_file)
 
-        self.emg_writer.writerow(["timestamp", "emg"])
-        self.mcu_writer.writerow(["timestamp", "angle", "load"])
-
+        self.emg_writer.writerow([
+            "lsl_timestamp_s",
+            "pc_timestamp_s",
+            "relative_time_s",
+            "emg"
+        ])
+        self.mcu_writer.writerow([
+            "pc_timestamp_s",
+            "mcu_timestamp_us",
+            "angle_raw",
+            "angle_deg",
+            "load_raw",
+            "load_norm"
+        ])
         self.emg_file.flush()
         self.mcu_file.flush()
 
@@ -87,8 +98,14 @@ class StorageThread(QThread):
 
         while emg_written < self.max_emg_rows_per_cycle:
             try:
-                t, v = self.emg_q.get_nowait()
-                self.emg_writer.writerow([t, v])
+                lsl_ts, pc_ts, t_rel, v = self.emg_q.get_nowait()
+
+                self.emg_writer.writerow([
+                    lsl_ts,
+                    pc_ts,
+                    t_rel,
+                    v
+                ])
                 emg_written += 1
             except Empty:
                 break
@@ -101,8 +118,15 @@ class StorageThread(QThread):
 
         while mcu_written < self.max_mcu_rows_per_cycle:
             try:
-                t, a, l = self.mcu_q.get_nowait()
-                self.mcu_writer.writerow([t, a, l])
+                pc_t, mcu_t, angle_raw, angle, load_raw, load_norm = self.mcu_q.get_nowait()
+                self.mcu_writer.writerow([
+                    pc_t,
+                    mcu_t,
+                    angle_raw,
+                    angle,
+                    load_raw,
+                    load_norm
+                ])
                 mcu_written += 1
             except Empty:
                 break
@@ -126,8 +150,14 @@ class StorageThread(QThread):
 
             try:
                 while True:
-                    t, v = self.emg_q.get_nowait()
-                    self.emg_writer.writerow([t, v])
+                    lsl_ts, pc_ts, t_rel, v = self.emg_q.get_nowait()
+
+                    self.emg_writer.writerow([
+                        lsl_ts,
+                        pc_ts,
+                        t_rel,
+                        v
+                    ])
                     any_written = True
             except Empty:
                 pass
@@ -136,8 +166,16 @@ class StorageThread(QThread):
 
             try:
                 while True:
-                    t, a, l = self.mcu_q.get_nowait()
-                    self.mcu_writer.writerow([t, a, l])
+                    pc_t, mcu_t, angle_raw, angle, load_raw, load_norm = self.mcu_q.get_nowait()
+
+                    self.mcu_writer.writerow([
+                        pc_t,
+                        mcu_t,
+                        angle_raw,
+                        angle,
+                        load_raw,
+                        load_norm
+                    ])
                     any_written = True
             except Empty:
                 pass

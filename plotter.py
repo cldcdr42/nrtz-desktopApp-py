@@ -53,22 +53,30 @@ def _to_float(value):
 
 
 def _load_emg_csv(path: Path):
+
     timestamps = []
     values = []
 
     with open(path, "r", encoding="utf-8", newline="") as f:
+
         reader = csv.DictReader(f)
 
         if reader.fieldnames is None:
             raise ValueError("emg.csv has no header.")
 
-        required = {"timestamp", "emg"}
+        required = {
+            "relative_time_s",
+            "emg"
+        }
 
         if not required.issubset(set(reader.fieldnames)):
-            raise ValueError("emg.csv must contain columns: timestamp, emg")
+            raise ValueError(
+                "emg.csv must contain columns: relative_time_s, emg"
+            )
 
         for row in reader:
-            t = _to_float(row.get("timestamp"))
+
+            t = _to_float(row.get("relative_time_s"))
             v = _to_float(row.get("emg"))
 
             if t is None or v is None:
@@ -80,35 +88,37 @@ def _load_emg_csv(path: Path):
     if not timestamps:
         raise ValueError("emg.csv contains no valid numeric data.")
 
-    # Important:
-    # Do NOT normalize here.
-    # CSV timestamps are already relative to recording/session time.
-    t0 = timestamps[0]
-    timestamps = [t - t0 for t in timestamps]
-
     return timestamps, values
 
-
 def _load_mcu_csv(path: Path):
+
     timestamps = []
     angles = []
     loads = []
 
     with open(path, "r", encoding="utf-8", newline="") as f:
+
         reader = csv.DictReader(f)
 
         if reader.fieldnames is None:
             raise ValueError("mcu.csv has no header.")
 
-        required = {"timestamp", "angle", "load"}
+        required = {
+            "pc_timestamp_s",
+            "angle_deg",
+            "load_norm"
+        }
 
         if not required.issubset(set(reader.fieldnames)):
-            raise ValueError("mcu.csv must contain columns: timestamp, angle, load")
+            raise ValueError(
+                "mcu.csv must contain columns: pc_timestamp_s, angle_deg, load_norm"
+            )
 
         for row in reader:
-            t = _to_float(row.get("timestamp"))
-            a = _to_float(row.get("angle"))
-            l = _to_float(row.get("load"))
+
+            t = _to_float(row.get("pc_timestamp_s"))
+            a = _to_float(row.get("angle_deg"))
+            l = _to_float(row.get("load_norm"))
 
             if t is None or a is None or l is None:
                 continue
@@ -120,9 +130,10 @@ def _load_mcu_csv(path: Path):
     if not timestamps:
         raise ValueError("mcu.csv contains no valid numeric data.")
 
-    # Important:
-    # Do NOT normalize here.
-    # CSV timestamps are already relative to recording/session time.
+    # convert PC absolute timestamps to relative session time
+    t0 = timestamps[0]
+    timestamps = [t - t0 for t in timestamps]
+
     return timestamps, angles, loads
 
 

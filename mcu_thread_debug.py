@@ -53,8 +53,8 @@ def log_exception(message: str):
 
 class MCUThread(QThread):
 
-    # pc_local_clock_timestamp, angle, normalized_load
-    data = pyqtSignal(float, float, float)
+    # pc_local_clock_timestamp, mcu_time, angle_raw, angle, load_raw, load_norm
+    data = pyqtSignal(float, float, float, float, float, float)
 
     # raw JSON line for UDP forwarding
     raw = pyqtSignal(str)
@@ -224,7 +224,7 @@ class MCUThread(QThread):
 
                 # Arduino timestamp is parsed for validation/debug,
                 # but currently not used for saved timestamps.
-                mcu_ts, angle, load = parsed
+                mcu_ts, angle_raw, angle, load = parsed
 
                 # -------------------------------------------------
                 # Timestamp source
@@ -261,7 +261,14 @@ class MCUThread(QThread):
 
                 self.valid_count += 1
 
-                self.data.emit(aligned_ts, angle, load_norm)
+                self.data.emit(
+                    aligned_ts,
+                    mcu_ts,
+                    angle_raw,
+                    angle,
+                    load,
+                    load_norm
+                    )
 
                 self._periodic_debug_report()
 
@@ -438,29 +445,31 @@ class MCUThread(QThread):
         # Fallback for older firmware, useful for debugging
         t_ms = data.get("t_ms")
 
+        angle_raw = data.get("angle_raw")
         angle = data.get("angle_deg")
         load = data.get("force_g")
 
-        if angle is None or load is None:
+        if angle_raw is None or angle is None or load is None:
             return None
 
         try:
 
             if t_us is not None:
-                mcu_ts = float(t_us) * 1e-6
+                mcu_ts = int(t_us)
             elif t_ms is not None:
                 mcu_ts = float(t_ms) * 1e-3
                 log_print("[MCU WARNING] Firmware sent t_ms instead of t_us")
             else:
                 return None
-
+            
+            angle_raw = float(angle_raw)
             angle = float(angle)
             load = float(load)
 
         except Exception:
             return None
 
-        return mcu_ts, angle, load
+        return mcu_ts, angle_raw, angle, load
 
     # =====================================================
     # ERROR CLEANUP

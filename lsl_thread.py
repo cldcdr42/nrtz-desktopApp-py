@@ -143,7 +143,16 @@ class LSLThread(QThread):
                         continue
 
                     # Full-rate saving
-                    self.emg_queue.put((t_rel, value))
+                    pc_ts = local_clock()
+
+                    self.emg_queue.put(
+                        (
+                            sample_ts,
+                            pc_ts,
+                            t_rel,
+                            value
+                        )
+                    )
 
                     self.saved_count += 1
                     latest_t_rel = t_rel
