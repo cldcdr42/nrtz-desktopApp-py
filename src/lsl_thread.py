@@ -1,3 +1,13 @@
+"""
+lsl_thread.py
+
+Acquisition worker for a single LSL (Lab Streaming Layer) stream. One
+instance of this class is created per logical stream (EMG data, raw
+data, events, raw events) — see main.py for how they're wired up.
+Handles connecting to the matching LSL stream, pulling samples, and
+routing them to CSV storage and (optionally) the live plot.
+"""
+
 from PyQt5.QtCore import QThread, pyqtSignal
 from pylsl import resolve_streams, StreamInlet
 import traceback
@@ -64,6 +74,9 @@ class LSLStreamWorker(QThread):
         self.inlet = None
         self.channel_count = None
 
+        # Tracks whether we were mid-recording on the previous loop
+        # iteration, so the transition into a new recording (buffer
+        # flush, timestamp reset) only fires once, right at the start.
         self.was_recording = False
         self.last_plot_emit_time = 0.0
         self.first_lsl_ts = None
@@ -97,6 +110,10 @@ class LSLStreamWorker(QThread):
 
                 if not self.was_recording:
 
+                    # Drop any samples LSL buffered before recording
+                    # actually started, so t=0 lines up with the real
+                    # start of the session rather than whenever the
+                    # stream first connected.
                     try:
                         flushed = self.inlet.flush()
                         print(f"[LSL:{self.label}] flushed {flushed} old samples")
@@ -148,6 +165,9 @@ class LSLStreamWorker(QThread):
                     latest_t_rel = t_rel
                     latest_first_ch = channels[0] if channels else None
 
+                # Only emit for the plot at most once per plot_interval,
+                # using the last sample in the chunk — no need to emit
+                # per-sample when the GUI can't render that fast anyway.
                 if self.plot_interval is not None and latest_t_rel is not None:
                     now = time.perf_counter()
                     if now - self.last_plot_emit_time >= self.plot_interval:

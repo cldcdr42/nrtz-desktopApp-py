@@ -1,4 +1,6 @@
 """
+config.py
+
 User-editable settings, stored at project_root/config/settings.ini.
 
 Defaults are hardcoded here and always used as a fallback -- a missing,
@@ -9,6 +11,7 @@ first run so there's always something for the user to open and edit.
 
 import configparser
 from pathlib import Path
+
 from utils import project_root
 
 _CONFIG_FILENAME = "settings.ini"

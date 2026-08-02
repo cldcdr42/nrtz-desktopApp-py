@@ -1,4 +1,6 @@
 """
+logging_setup.py
+
 Centralized logging setup for the whole app.
 
 Call init_logging() exactly once, as early as possible in main.py —

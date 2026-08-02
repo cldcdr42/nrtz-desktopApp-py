@@ -1,3 +1,14 @@
+"""
+plotter.py
+
+Post-session plotting: reads a saved session folder (data.csv +
+mcu.csv, written by StorageThread during a recording) and produces a
+two-panel matplotlib figure — EMG on top, angle/load on the bottom —
+aligned to their shared overlapping time range. Used by the "Построить
+график сохранённого сеанса" button in main.py, not during live
+recording (that uses pyqtgraph in main.py instead).
+"""
+
 from pathlib import Path
 import re
 import csv
@@ -8,6 +19,10 @@ matplotlib.use("Qt5Agg")
 import matplotlib.pyplot as plt
 
 
+# Keeps a reference to every figure we open so matplotlib doesn't
+# garbage-collect (and silently close) them once plot_session_folder()
+# returns — figures are shown non-blocking (block=False) so the GUI
+# stays responsive while multiple session plots are open at once.
 _OPEN_FIGURES = []
 
 
@@ -70,10 +85,7 @@ def _load_data_csv(path: Path, channel_col: str = "ch0"):
         if reader.fieldnames is None:
             raise ValueError("data.csv has no header.")
 
-        required = {
-            "relative_time_s",
-            channel_col
-        }
+        required = {"relative_time_s", channel_col}
 
         if not required.issubset(set(reader.fieldnames)):
             raise ValueError(
@@ -96,6 +108,7 @@ def _load_data_csv(path: Path, channel_col: str = "ch0"):
 
     return timestamps, values
 
+
 def _load_mcu_csv(path: Path):
 
     timestamps = []
@@ -109,11 +122,7 @@ def _load_mcu_csv(path: Path):
         if reader.fieldnames is None:
             raise ValueError("mcu.csv has no header.")
 
-        required = {
-            "pc_perf_counter_s",
-            "angle_deg",
-            "load_norm"
-        }
+        required = {"pc_perf_counter_s", "angle_deg", "load_norm"}
 
         if not required.issubset(set(reader.fieldnames)):
             raise ValueError(
@@ -124,19 +133,21 @@ def _load_mcu_csv(path: Path):
 
             t = _to_float(row.get("pc_perf_counter_s"))
             a = _to_float(row.get("angle_deg"))
-            l = _to_float(row.get("load_norm"))
+            load_val = _to_float(row.get("load_norm"))
 
-            if t is None or a is None or l is None:
+            if t is None or a is None or load_val is None:
                 continue
 
             timestamps.append(t)
             angles.append(a)
-            loads.append(l)
+            loads.append(load_val)
 
     if not timestamps:
         raise ValueError("mcu.csv contains no valid numeric data.")
 
-    # convert PC absolute timestamps to relative session time
+    # MCU rows are stored with absolute pc_perf_counter timestamps —
+    # convert to relative session time here so it lines up with the
+    # EMG stream, which is already relative.
     t0 = timestamps[0]
     timestamps = [t - t0 for t in timestamps]
 
@@ -191,8 +202,9 @@ def plot_session_folder(session_folder):
     emg_t, emg_v = _load_data_csv(emg_file)
     mcu_t, angle_v, load_v = _load_mcu_csv(mcu_file)
 
-    # Shared common time range.
-    # Start from the later first timestamp, end at the earlier last timestamp.
+    # Shared common time range: start from the later first timestamp,
+    # end at the earlier last timestamp, so both streams are plotted
+    # only over the window where both actually have data.
     shared_start = max(min(emg_t), min(mcu_t))
     shared_end = min(max(emg_t), max(mcu_t))
 

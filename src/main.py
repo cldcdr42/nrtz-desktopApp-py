@@ -1,3 +1,12 @@
+"""
+main.py
+
+Application entry point and main GUI window (PyQt5). Wires together
+all the acquisition threads (LSL streams, MCU serial, UDP forwarding,
+CSV storage), owns the live plot, and handles session start/stop and
+recording-session bookkeeping (session folder, session_info.txt).
+"""
+
 import sys
 import threading
 import os
@@ -18,8 +27,6 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QTimer
 import pyqtgraph as pg
-
-from pylsl import local_clock
 
 
 from lsl_thread import LSLStreamWorker
@@ -42,9 +49,9 @@ class MainApp(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        # -----------------------
+        # =====================================================
         # STATE
-        # -----------------------
+        # =====================================================
         self.recording = False
         self.start_event = threading.Event()
         self.folder = None
@@ -77,48 +84,48 @@ class MainApp(QMainWindow):
             "ТОЛЬКО при начале сеанса записи (нажатии кнопки старт)"
         )
 
-        # -----------------------
+        # =====================================================
         # TIME BASE
-        # -----------------------
+        # =====================================================
         self.session_start = None
 
         # Kept for compatibility
         self.emg_start_time = None
 
-        # -----------------------
+        # =====================================================
         # QUEUES
-        # -----------------------
+        # =====================================================
         self.data_queue = Queue()
         self.raw_data_queue = Queue()
         self.events_queue = Queue()
         self.raw_events_queue = Queue()
         self.mcu_queue = Queue()
 
-        # -----------------------
+        # =====================================================
         # BUFFERS
-        # -----------------------
+        # =====================================================
         # EMG plot buffers:
         #   self.t_emg = display-only sample-index time
         #   self.v_emg = EMG values
         #
         # MCU plot buffers:
         #   real relative timestamps
-        # -----------------------
+        # =====================================================
         self.t_emg, self.v_emg = [], []
         self.t_mcu, self.angle, self.load = [], [], []
 
-        # -----------------------
+        # =====================================================
         # THREADS
-        # -----------------------
+        # =====================================================
         self.lsl_data = LSLStreamWorker(
             label="data", stream_type="Data",
             start_event=self.start_event, out_queue=self.data_queue,
             plot_hz=50.0,   # this one drives the live EMG plot, as before
-            )
+        )
         self.lsl_raw_data = LSLStreamWorker(
             label="raw_data", stream_type="Raw_Data",
             start_event=self.start_event, out_queue=self.raw_data_queue,
-            plot_hz=0.0,    # logged only, not plotted — see question below
+            plot_hz=0.0,    # logged only, not plotted
         )
         self.lsl_events = LSLStreamWorker(
             label="events", stream_type="Events",
@@ -133,7 +140,6 @@ class MainApp(QMainWindow):
             pull_timeout=0.5,
         )
 
-        from config import load_config
         self.cfg = load_config()
 
         mcu_port = self.cfg.get("mcu", "port", fallback="COM6")
@@ -153,7 +159,7 @@ class MainApp(QMainWindow):
         self.storage_thread.register_stream("raw_data",   self.raw_data_queue,   "raw_data.csv",   header=self.lsl_raw_data.header)
         self.storage_thread.register_stream("events",     self.events_queue,     "events.csv",     header=self.lsl_events.header, max_rows_per_cycle=50)
         self.storage_thread.register_stream("raw_events", self.raw_events_queue, "raw_events.csv", header=self.lsl_raw_events.header, max_rows_per_cycle=50)
-        self.storage_thread.register_stream("mcu",        self.mcu_queue,        "mcu.csv",        header=["pc_perf_counter_s","mcu_timestamp_us","angle_raw","angle_deg","load_raw","load_norm"])
+        self.storage_thread.register_stream("mcu",        self.mcu_queue,        "mcu.csv",        header=["pc_perf_counter_s", "mcu_timestamp_us", "angle_raw", "angle_deg", "load_raw", "load_norm"])
 
         self.lsl_data.data.connect(self.on_emg)
         self.mcu_thread.data.connect(self.on_mcu)
@@ -176,7 +182,10 @@ class MainApp(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plot)
 
-    #==================================================
+    # =====================================================
+    # MENU
+    # =====================================================
+
     def init_menu(self):
         menubar = self.menuBar()
         help_menu = menubar.addMenu("Справка")
@@ -193,7 +202,6 @@ class MainApp(QMainWindow):
         open_settings_action.triggered.connect(self.open_settings_file)
         help_menu.addAction(open_settings_action)
 
-
     def show_about(self):
         QMessageBox.information(
             self,
@@ -204,7 +212,6 @@ class MainApp(QMainWindow):
             f"Настройки:\n{settings_path()}"
         )
 
-
     def open_log_file(self):
         path = logs_dir() / "app.log"
         if not path.exists():
@@ -212,14 +219,12 @@ class MainApp(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
-
     def open_settings_file(self):
         path = settings_path()
         if not path.exists():
             QMessageBox.warning(self, "Файл не найден", f"Файл настроек не найден:\n{path}")
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
-
 
     # =====================================================
     # SESSION
@@ -232,7 +237,7 @@ class MainApp(QMainWindow):
 
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
 
-        self.folder = folder_base / ts   # was: self.folder = data_dir / ts
+        self.folder = folder_base / ts
         self.folder.mkdir(parents=True, exist_ok=True)
 
         # -------------------------
@@ -253,14 +258,14 @@ class MainApp(QMainWindow):
             f.write(
                 f"Session start perf_counter: "
                 f"{self.session_start:.9f}\n"
-            )         
+            )
 
         print("\n[SESSION START]")
         print(self.folder)
 
     def get_folder(self):
         return self.folder
-    
+
     def get_session_start(self):
         return self.session_start
 
@@ -404,7 +409,7 @@ class MainApp(QMainWindow):
 
         # Always resolve base data directory via existing helper
         folder_base = data_dir()
-        path = str(folder_base)  
+        path = str(folder_base)
 
         # Windows only
         if os.name == "nt":
@@ -435,7 +440,6 @@ class MainApp(QMainWindow):
         self.plot.nextRow()
         self.load_plot = self.plot.addPlot(title="Load")
         self.load_curve = self.load_plot.plot(pen="r")
-
 
         pg.setConfigOptions(antialias=False)
 
@@ -474,7 +478,6 @@ class MainApp(QMainWindow):
         if hasattr(self.mcu_thread, "reset_sync"):
             self.mcu_thread.reset_sync()
 
-        # wherever line 349-350 currently is:
         for worker in (self.lsl_data, self.lsl_raw_data, self.lsl_events, self.lsl_raw_events):
             worker.reset_sync()
 
@@ -493,7 +496,7 @@ class MainApp(QMainWindow):
         self.port_combo.setEnabled(False)
         self.port_refresh_btn.setEnabled(False)
 
-        self.timer.start(50)   # was 30
+        self.timer.start(50)
 
         print("[START]")
 
@@ -518,8 +521,8 @@ class MainApp(QMainWindow):
         self.t_mcu, self.angle, self.load = [], [], []
 
         for q in (self.data_queue, self.raw_data_queue,
-                self.events_queue, self.raw_events_queue,
-                self.mcu_queue):
+                  self.events_queue, self.raw_events_queue,
+                  self.mcu_queue):
             while not q.empty():
                 try:
                     q.get_nowait()
@@ -529,7 +532,7 @@ class MainApp(QMainWindow):
         while not self.mcu_queue.empty():
             try:
                 self.mcu_queue.get_nowait()
-            except:
+            except Exception:
                 break
 
     def _finish_stop(self):
@@ -542,6 +545,7 @@ class MainApp(QMainWindow):
     # =====================================================
     # DATA HANDLERS
     # =====================================================
+
     def on_emg(self, t_rel, v):
 
         # -------------------------------------------------
@@ -556,34 +560,7 @@ class MainApp(QMainWindow):
         self.v_emg.append(v)
 
         self.trim_many(self.t_emg, self.v_emg, max_len=5000)
-    
-    """
-    def on_emg(self, t, v):
 
-        if self.session_start is None:
-            self.session_start = t
-            print(f"[SESSION START] EMG @ {t:.6f}")
-
-        # -------------------------------------------------
-        # Real synchronized relative timestamp for CSV
-        # -------------------------------------------------
-        t_rel = t - self.session_start
-
-        # CSV gets real timing
-        self.emg_queue.put((t_rel, v))
-
-        # -------------------------------------------------
-        # Live plot only:
-        # Use evenly spaced display time instead of real receive timestamps.
-        # -------------------------------------------------
-        plot_t = self.emg_plot_sample_index / self.emg_plot_fs
-        self.emg_plot_sample_index += 1
-
-        self.t_emg.append(plot_t)
-        self.v_emg.append(v)
-
-        self.trim_many(self.t_emg, self.v_emg, max_len=5000)
-    """
     def on_mcu(self, pc_time, mcu_time_us, angle_raw, a, load_raw, load_norm):
 
         if self.session_start is None:
@@ -606,9 +583,6 @@ class MainApp(QMainWindow):
         self.angle.append(a)
         self.load.append(load_norm)
 
-        #print(load_norm)
-        #print(load_norm, "norm")
-
         self.trim_many(self.t_mcu, self.angle, self.load, max_len=5000)
 
     def trim_many(self, *lists, max_len=5000):
@@ -627,26 +601,21 @@ class MainApp(QMainWindow):
             if len(x) > max_len:
                 del x[:-max_len]
 
-    """
-    def open_plotter(self):
-        QMessageBox.information(
-            self,
-            "Disabled in debug build",
-            "Saved-session plotting is disabled in this debug build."
-        )
-    """
     def open_plotter(self):
 
-        # data_dir = data_dir()
         folder_base = data_dir()
 
-        if not folder_base.exists():                    # was: if not data_dir.exists():
-            ...
-            f"Папка с данными не найдена:\n{folder_base}"  # was: {data_dir}
+        if not folder_base.exists():
+            QMessageBox.warning(
+                self,
+                "Папка не найдена",
+                f"Папка с данными не найдена:\n{folder_base}"
+            )
+            return
 
         selected_folder = QFileDialog.getExistingDirectory(
             self, "Выберите папку сеанса",
-            str(folder_base),                            # was: str(data_dir)
+            str(folder_base),
             QFileDialog.ShowDirsOnly
         )
 
@@ -663,7 +632,6 @@ class MainApp(QMainWindow):
                 str(e)
             )
 
-    
     # =====================================================
     # PLOT UPDATE
     # =====================================================
@@ -729,10 +697,9 @@ class MainApp(QMainWindow):
 
         try:
             self.timer.stop()
-        except:
+        except Exception:
             pass
 
-        # wherever line 610 currently is:
         for worker in (self.lsl_data, self.lsl_raw_data, self.lsl_events, self.lsl_raw_events):
             worker.stop()
 

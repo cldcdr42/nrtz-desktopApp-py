@@ -1,13 +1,19 @@
+"""
+mcu_thread.py
+
+Serial acquisition worker for the MCU (Arduino) sending angle/load
+sensor data over a COM port as JSON lines. Handles connecting/
+reconnecting to the serial port, parsing each line, normalizing the
+HX711 load cell reading to a -1..+1 range, and forwarding both parsed
+data (for plotting/CSV) and raw JSON (for UDP forwarding) via signals.
+"""
+
 from PyQt5.QtCore import QThread, pyqtSignal
 
 import serial
 import serial.tools.list_ports
 import time
 import json
-import traceback
-import logging
-import sys
-from pathlib import Path
 
 from logging_setup import log_print, log_exception
 
@@ -233,7 +239,7 @@ class MCUThread(QThread):
                     angle,
                     load,
                     load_norm
-                    )
+                )
 
                 self._periodic_debug_report()
 
@@ -288,10 +294,6 @@ class MCUThread(QThread):
         self.last_debug_report_time = now
 
     # =====================================================
-    # SERIAL CONNECTION
-    # =====================================================
-
-    # =====================================================
     # LIVE PORT CHANGE (requested from GUI thread)
     # =====================================================
 
@@ -327,6 +329,10 @@ class MCUThread(QThread):
         # recording start, so the user gets feedback right away if
         # the new port doesn't work.
         self.connect()
+
+    # =====================================================
+    # SERIAL CONNECTION
+    # =====================================================
 
     def connect(self):
 
@@ -463,7 +469,7 @@ class MCUThread(QThread):
                 log_print("[MCU WARNING] Firmware sent t_ms instead of t_us")
             else:
                 return None
-            
+
             angle_raw = float(angle_raw)
             angle = float(angle)
             load = float(load)
@@ -499,7 +505,7 @@ class MCUThread(QThread):
 
         self.load_zero = None
         self.load_zero_samples = []
-        
+
         self.raw_count = 0
         self.valid_count = 0
         self.parse_reject_count = 0

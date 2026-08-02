@@ -1,3 +1,12 @@
+"""
+storage_thread.py
+
+Generic multi-stream CSV storage worker. Owns all file I/O for
+recording sessions — every other thread just pushes rows into a
+queue (or calls push()) and this thread handles opening files,
+writing headers, flushing, and closing them at the end of a session.
+"""
+
 from PyQt5.QtCore import QThread
 from queue import Queue, Empty
 import threading
@@ -142,6 +151,10 @@ class StorageThread(QThread):
     # =====================================================
 
     def _snapshot_streams(self):
+        # Copy the dict under the lock, then iterate the copy outside
+        # of it — register_stream()/push() can be called concurrently
+        # from other threads, and we don't want the write loop below
+        # holding the lock for the whole cycle.
         with self._lock:
             return list(self.streams.items())
 
@@ -207,6 +220,9 @@ class StorageThread(QThread):
             limit = cfg.get("max_rows_per_cycle", 500)
             written = 0
 
+            # Capped per stream per cycle, so one very high-rate stream
+            # can't starve the others (or the flush check below) if its
+            # queue backs up.
             while written < limit:
                 try:
                     row = q.get_nowait()
@@ -231,7 +247,9 @@ class StorageThread(QThread):
             self.cycles_since_flush = 0
 
     def flush_all(self):
-
+        # Called once when recording stops — unlike flush_some(), this
+        # drains every queue completely rather than capping rows per
+        # cycle, so nothing buffered gets lost at the end of a session.
         while True:
 
             any_written = False

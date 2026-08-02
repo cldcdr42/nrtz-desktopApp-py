@@ -1,4 +1,6 @@
 """
+utils.py
+
 Single source of truth for app-relative paths, correct both for a normal
 `python src/main.py` run and for a Nuitka standalone build placed in src/.
 

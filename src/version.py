@@ -1,4 +1,6 @@
 """
+version.py
+
 Single source of truth for the app's version string and build date,
 shown in the About dialog.
 
