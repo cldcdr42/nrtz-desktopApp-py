@@ -9,45 +9,7 @@ import logging
 import sys
 from pathlib import Path
 
-
-# =====================================================
-# DEBUG LOGGING SETUP
-# =====================================================
-
-def _app_base_dir() -> Path:
-    """
-    Returns app folder both in normal Python and Nuitka standalone exe.
-    """
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-
-    return Path(__file__).resolve().parent
-
-
-LOG_FILE = _app_base_dir() / "mcu_debug.log"
-
-logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
-)
-
-
-def log_print(message: str):
-    """
-    Print to console and also write to debug log file.
-    """
-    print(message, flush=True)
-    logging.info(message)
-
-
-def log_exception(message: str):
-    """
-    Print traceback and write it to log file.
-    """
-    print(message, flush=True)
-    traceback.print_exc()
-    logging.exception(message)
+from logging_setup import log_print, log_exception
 
 
 class MCUThread(QThread):
@@ -102,7 +64,6 @@ class MCUThread(QThread):
         self.last_empty_warning_time = time.monotonic()
 
         log_print("[MCU DEBUG] MCUThread created")
-        log_print(f"[MCU DEBUG] Log file: {LOG_FILE}")
         log_print(f"[MCU DEBUG] Initial port={self.port}, baud={self.baud}")
 
     # =====================================================

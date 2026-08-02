@@ -52,7 +52,13 @@ def _to_float(value):
         return None
 
 
-def _load_emg_csv(path: Path):
+def _load_data_csv(path: Path, channel_col: str = "ch0"):
+    """
+    Loads the LSL 'Data' stream CSV (data.csv), written by
+    LSLStreamWorker.header(): lsl_timestamp_s, pc_perf_counter_s,
+    relative_time_s, ch0, ch1, ... — plots a single channel
+    (ch0 by default) against relative_time_s.
+    """
 
     timestamps = []
     values = []
@@ -62,22 +68,22 @@ def _load_emg_csv(path: Path):
         reader = csv.DictReader(f)
 
         if reader.fieldnames is None:
-            raise ValueError("emg.csv has no header.")
+            raise ValueError("data.csv has no header.")
 
         required = {
             "relative_time_s",
-            "emg"
+            channel_col
         }
 
         if not required.issubset(set(reader.fieldnames)):
             raise ValueError(
-                "emg.csv must contain columns: relative_time_s, emg"
+                f"data.csv must contain columns: relative_time_s, {channel_col}"
             )
 
         for row in reader:
 
             t = _to_float(row.get("relative_time_s"))
-            v = _to_float(row.get("emg"))
+            v = _to_float(row.get(channel_col))
 
             if t is None or v is None:
                 continue
@@ -86,7 +92,7 @@ def _load_emg_csv(path: Path):
             values.append(v)
 
     if not timestamps:
-        raise ValueError("emg.csv contains no valid numeric data.")
+        raise ValueError("data.csv contains no valid numeric data.")
 
     return timestamps, values
 
@@ -170,7 +176,7 @@ def plot_session_folder(session_folder):
     if not session_folder.is_dir():
         raise NotADirectoryError(f"Selected path is not a folder: {session_folder}")
 
-    emg_file = session_folder / "emg.csv"
+    emg_file = session_folder / "data.csv"
     mcu_file = session_folder / "mcu.csv"
 
     if not emg_file.exists():
@@ -182,7 +188,7 @@ def plot_session_folder(session_folder):
     info = _read_session_info(session_folder)
 
     # Use real CSV timestamps directly.
-    emg_t, emg_v = _load_emg_csv(emg_file)
+    emg_t, emg_v = _load_data_csv(emg_file)
     mcu_t, angle_v, load_v = _load_mcu_csv(mcu_file)
 
     # Shared common time range.

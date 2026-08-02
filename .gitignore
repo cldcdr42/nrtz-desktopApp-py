@@ -5,12 +5,14 @@
 __pycache__/
 *.py[cod]
 
+# vscode folder
+.vscode/
+
 # Folder with recorded data
 data/
 
 # Folders for distributed app version
-main.build/
-main.dist
+nuitka_compiled/
 
 # Folder for Nuitka compiler
 pylsl/
@@ -21,5 +23,8 @@ build.bat
 # Folder for temporary files or utilites which are not necessary for the app
 utilities/
 
-# FIle with debug logs
-mcu_debug.log
+# Folder with logs
+logs/
+
+# Folder for temporary files
+temp/

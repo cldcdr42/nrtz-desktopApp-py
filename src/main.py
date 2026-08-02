@@ -4,8 +4,11 @@ import os
 import subprocess
 from queue import Queue
 from datetime import datetime
-from utils import resource_path
+from utils import data_dir
 import time
+
+from logging_setup import init_logging
+init_logging()
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
@@ -18,7 +21,8 @@ import pyqtgraph as pg
 
 from pylsl import local_clock
 
-from lsl_thread import LSLThread
+
+from lsl_thread import LSLStreamWorker
 from mcu_thread_debug import MCUThread
 from storage_thread import StorageThread
 from udp_sender_thread import UDPSenderThread
@@ -76,7 +80,10 @@ class MainApp(QMainWindow):
         # -----------------------
         # QUEUES
         # -----------------------
-        self.emg_queue = Queue()
+        self.data_queue = Queue()
+        self.raw_data_queue = Queue()
+        self.events_queue = Queue()
+        self.raw_events_queue = Queue()
         self.mcu_queue = Queue()
 
         # -----------------------
@@ -95,26 +102,52 @@ class MainApp(QMainWindow):
         # -----------------------
         # THREADS
         # -----------------------
-        self.lsl_thread = LSLThread(
-            self.start_event,
-            self.emg_queue,
-            self.get_session_start,
-            plot_hz=50.0,
+        self.lsl_data = LSLStreamWorker(
+            label="data", stream_type="Data",
+            start_event=self.start_event, out_queue=self.data_queue,
+            plot_hz=50.0,   # this one drives the live EMG plot, as before
             )
-        self.mcu_thread = MCUThread("COM6", 115200, self.start_event)
+        self.lsl_raw_data = LSLStreamWorker(
+            label="raw_data", stream_type="Raw_Data",
+            start_event=self.start_event, out_queue=self.raw_data_queue,
+            plot_hz=0.0,    # logged only, not plotted — see question below
+        )
+        self.lsl_events = LSLStreamWorker(
+            label="events", stream_type="Events",
+            start_event=self.start_event, out_queue=self.events_queue,
+            name_must_not_contain="raw", plot_hz=0.0,
+            pull_timeout=0.5,   # events are sparse, no need to poll at 20ms
+        )
+        self.lsl_raw_events = LSLStreamWorker(
+            label="raw_events", stream_type="Events",
+            start_event=self.start_event, out_queue=self.raw_events_queue,
+            name_must_contain="raw", plot_hz=0.0,
+            pull_timeout=0.5,
+        )
+
+        from config import load_config
+        cfg = load_config()
+
+        mcu_port = cfg.get("mcu", "port", fallback="COM6")
+        mcu_baud = cfg.getint("mcu", "baud", fallback=115200)
+
+        self.mcu_thread = MCUThread(mcu_port, mcu_baud, self.start_event)
         self.udp_thread = UDPSenderThread(self.start_event)
 
         self.mcu_thread.raw.connect(self.udp_thread.on_data)
 
         self.storage_thread = StorageThread(
-            self.emg_queue,
-            self.mcu_queue,
-            self.get_folder,
-            self.is_recording,
-            self.start_event
+            folder_getter=self.get_folder,
+            recording_flag=self.is_recording,
         )
 
-        self.lsl_thread.data.connect(self.on_emg)
+        self.storage_thread.register_stream("data",       self.data_queue,       "data.csv",       header=self.lsl_data.header)
+        self.storage_thread.register_stream("raw_data",   self.raw_data_queue,   "raw_data.csv",   header=self.lsl_raw_data.header)
+        self.storage_thread.register_stream("events",     self.events_queue,     "events.csv",     header=self.lsl_events.header, max_rows_per_cycle=50)
+        self.storage_thread.register_stream("raw_events", self.raw_events_queue, "raw_events.csv", header=self.lsl_raw_events.header, max_rows_per_cycle=50)
+        self.storage_thread.register_stream("mcu",        self.mcu_queue,        "mcu.csv",        header=["pc_perf_counter_s","mcu_timestamp_us","angle_raw","angle_deg","load_raw","load_norm"])
+
+        self.lsl_data.data.connect(self.on_emg)
         self.mcu_thread.data.connect(self.on_mcu)
 
         # UI
@@ -122,7 +155,10 @@ class MainApp(QMainWindow):
         self.init_plot()
 
         # start threads
-        self.lsl_thread.start()
+        self.lsl_data.start()
+        self.lsl_raw_data.start()
+        self.lsl_events.start()
+        self.lsl_raw_events.start()
         self.mcu_thread.start()
         self.storage_thread.start()
         self.udp_thread.start()
@@ -138,11 +174,11 @@ class MainApp(QMainWindow):
     def create_session(self):
 
         # Use a writable folder for CSVs
-        data_dir = resource_path("data", writable=True)
+        folder_base = data_dir()
 
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
 
-        self.folder = data_dir / ts
+        self.folder = folder_base / ts   # was: self.folder = data_dir / ts
         self.folder.mkdir(parents=True, exist_ok=True)
 
         # -------------------------
@@ -254,9 +290,8 @@ class MainApp(QMainWindow):
     def open_data_folder(self):
 
         # Always resolve base data directory via existing helper
-        data_dir = resource_path("data", writable=True)
-
-        path = str(data_dir)
+        folder_base = data_dir()
+        path = str(folder_base)  
 
         # Windows only
         if os.name == "nt":
@@ -319,8 +354,9 @@ class MainApp(QMainWindow):
         if hasattr(self.mcu_thread, "reset_sync"):
             self.mcu_thread.reset_sync()
 
-        if hasattr(self.lsl_thread, "reset_sync"):
-            self.lsl_thread.reset_sync()
+        # wherever line 349-350 currently is:
+        for worker in (self.lsl_data, self.lsl_raw_data, self.lsl_events, self.lsl_raw_events):
+            worker.reset_sync()
 
         # flush stale serial data
         if self.mcu_thread.ser is not None:
@@ -345,12 +381,7 @@ class MainApp(QMainWindow):
         self.start_event.clear()
 
         # give LSL thread time to flush / stop pulling after recording
-        time.sleep(0.3)
-
-        self.timer.stop()
-
-        print("[STOP]")
-        print("Saved in:", self.folder)
+        QTimer.singleShot(300, self._finish_stop)
 
     def is_recording(self):
         return self.recording
@@ -360,28 +391,28 @@ class MainApp(QMainWindow):
     # =====================================================
 
     def reset_buffers(self):
+        self.t_emg, self.v_emg = [], []
+        self.t_mcu, self.angle, self.load = [], [], []
 
-        # Reset EMG display-time axis
-        self.emg_plot_sample_index = 0
-
-        self.t_emg.clear()
-        self.v_emg.clear()
-
-        self.t_mcu.clear()
-        self.angle.clear()
-        self.load.clear()
-
-        while not self.emg_queue.empty():
-            try:
-                self.emg_queue.get_nowait()
-            except:
-                break
+        for q in (self.data_queue, self.raw_data_queue,
+                self.events_queue, self.raw_events_queue,
+                self.mcu_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    break
 
         while not self.mcu_queue.empty():
             try:
                 self.mcu_queue.get_nowait()
             except:
                 break
+
+    def _finish_stop(self):
+        self.timer.stop()
+        print("[STOP]")
+        print("Saved in:", self.folder)
 
     # =====================================================
     # DATA HANDLERS
@@ -481,20 +512,16 @@ class MainApp(QMainWindow):
     """
     def open_plotter(self):
 
-        data_dir = resource_path("data", writable=True)
+        # data_dir = data_dir()
+        folder_base = data_dir()
 
-        if not data_dir.exists():
-            QMessageBox.warning(
-                self,
-                "Папка не найдена",
-                f"Папка с данными не найдена:\n{data_dir}"
-            )
-            return
+        if not folder_base.exists():                    # was: if not data_dir.exists():
+            ...
+            f"Папка с данными не найдена:\n{folder_base}"  # was: {data_dir}
 
         selected_folder = QFileDialog.getExistingDirectory(
-            self,
-            "Выберите папку сеанса",
-            str(data_dir),
+            self, "Выберите папку сеанса",
+            str(folder_base),                            # was: str(data_dir)
             QFileDialog.ShowDirsOnly
         )
 
@@ -580,7 +607,10 @@ class MainApp(QMainWindow):
         except:
             pass
 
-        self.lsl_thread.stop()
+        # wherever line 610 currently is:
+        for worker in (self.lsl_data, self.lsl_raw_data, self.lsl_events, self.lsl_raw_events):
+            worker.stop()
+
         self.mcu_thread.stop()
         self.storage_thread.stop()
         self.udp_thread.stop()
