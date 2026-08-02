@@ -23,7 +23,7 @@ from pylsl import local_clock
 
 
 from lsl_thread import LSLStreamWorker
-from mcu_thread_debug import MCUThread
+from mcu_thread import MCUThread
 from storage_thread import StorageThread
 from udp_sender_thread import UDPSenderThread
 from plotter import plot_session_folder
