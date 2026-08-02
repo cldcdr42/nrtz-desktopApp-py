@@ -33,6 +33,11 @@ class MCUThread(QThread):
 
         self.was_recording = False
 
+        # Set from another thread (GUI) via request_port_change(); the
+        # run() loop below applies it on its own thread, never touched
+        # directly from outside.
+        self._pending_port = None
+
         # ----------------------------------------
         # HX711 relative normalization settings
         # ----------------------------------------
@@ -76,6 +81,8 @@ class MCUThread(QThread):
         self.connect()
 
         while self.running:
+
+            self._apply_pending_port_change()
 
             recording = self.start_event.is_set()
 
@@ -283,6 +290,43 @@ class MCUThread(QThread):
     # =====================================================
     # SERIAL CONNECTION
     # =====================================================
+
+    # =====================================================
+    # LIVE PORT CHANGE (requested from GUI thread)
+    # =====================================================
+
+    def request_port_change(self, new_port):
+        """
+        Thread-safe entry point for the GUI to ask for a different COM
+        port. Only sets a flag — the actual reconnect happens inside
+        run(), on this thread, never here.
+        """
+        self._pending_port = new_port
+        log_print(f"[MCU] Port change requested -> {new_port}")
+
+    def _apply_pending_port_change(self):
+
+        if self._pending_port is None:
+            return
+
+        new_port = self._pending_port
+        self._pending_port = None
+
+        log_print(f"[MCU DEBUG] Applying pending port change -> {new_port}")
+
+        self.port = new_port
+
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:
+                log_exception("[MCU ERROR] Failed to close serial port during port change")
+            self.ser = None
+
+        # Reconnect immediately rather than waiting for the next
+        # recording start, so the user gets feedback right away if
+        # the new port doesn't work.
+        self.connect()
 
     def connect(self):
 

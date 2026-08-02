@@ -17,7 +17,7 @@ from pathlib import Path
 APP_NAME = "YourAppName"  # used only for the OS-data-dir fallback below
 
 
-def _is_frozen() -> bool:
+def is_frozen() -> bool:
     """
     True when running as a compiled build, False in normal `python
     main.py` dev mode.
@@ -38,7 +38,7 @@ def _is_frozen() -> bool:
 
 def app_base_dir() -> Path:
     """Folder the running script/exe lives in (src/)."""
-    if _is_frozen():
+    if is_frozen():
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
@@ -61,7 +61,7 @@ def project_root() -> Path:
     This is the only place that encodes the layout difference — if it
     ever changes again, this is the only line to update.
     """
-    if _is_frozen():
+    if is_frozen():
         return app_base_dir()
     return app_base_dir().parent
 

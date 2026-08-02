@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QPushButton, QLineEdit,
     QTextEdit, QLabel, QMessageBox,
-    QFileDialog, QHBoxLayout
+    QFileDialog, QHBoxLayout, QComboBox
 )
 from PyQt5.QtCore import QTimer
 import pyqtgraph as pg
@@ -27,6 +27,14 @@ from mcu_thread import MCUThread
 from storage_thread import StorageThread
 from udp_sender_thread import UDPSenderThread
 from plotter import plot_session_folder
+
+import serial.tools.list_ports
+from PyQt5.QtWidgets import QAction
+from PyQt5.QtGui import QDesktopServices
+from PyQt5.QtCore import QUrl
+from config import load_config, save_config, settings_path
+from utils import logs_dir
+from version import APP_NAME, APP_VERSION, get_build_date
 
 
 class MainApp(QMainWindow):
@@ -126,10 +134,10 @@ class MainApp(QMainWindow):
         )
 
         from config import load_config
-        cfg = load_config()
+        self.cfg = load_config()
 
-        mcu_port = cfg.get("mcu", "port", fallback="COM6")
-        mcu_baud = cfg.getint("mcu", "baud", fallback=115200)
+        mcu_port = self.cfg.get("mcu", "port", fallback="COM6")
+        mcu_baud = self.cfg.getint("mcu", "baud", fallback=115200)
 
         self.mcu_thread = MCUThread(mcu_port, mcu_baud, self.start_event)
         self.udp_thread = UDPSenderThread(self.start_event)
@@ -152,6 +160,7 @@ class MainApp(QMainWindow):
 
         # UI
         self.init_ui()
+        self.init_menu()
         self.init_plot()
 
         # start threads
@@ -166,6 +175,51 @@ class MainApp(QMainWindow):
         # plot timer
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plot)
+
+    #==================================================
+    def init_menu(self):
+        menubar = self.menuBar()
+        help_menu = menubar.addMenu("Справка")
+
+        about_action = QAction("О программе", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+
+        open_log_action = QAction("Открыть лог-файл", self)
+        open_log_action.triggered.connect(self.open_log_file)
+        help_menu.addAction(open_log_action)
+
+        open_settings_action = QAction("Открыть файл настроек", self)
+        open_settings_action.triggered.connect(self.open_settings_file)
+        help_menu.addAction(open_settings_action)
+
+
+    def show_about(self):
+        QMessageBox.information(
+            self,
+            "О программе",
+            f"{APP_NAME}\nВерсия: {APP_VERSION}\nСборка от: {get_build_date()}\n\n"
+            f"Данные:\n{data_dir()}\n"
+            f"Логи:\n{logs_dir()}\n"
+            f"Настройки:\n{settings_path()}"
+        )
+
+
+    def open_log_file(self):
+        path = logs_dir() / "app.log"
+        if not path.exists():
+            QMessageBox.warning(self, "Файл не найден", f"Лог-файл не найден:\n{path}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+
+    def open_settings_file(self):
+        path = settings_path()
+        if not path.exists():
+            QMessageBox.warning(self, "Файл не найден", f"Файл настроек не найден:\n{path}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
 
     # =====================================================
     # SESSION
@@ -261,6 +315,25 @@ class MainApp(QMainWindow):
         right_layout.addWidget(QLabel("Время проведения сеанса"))
         right_layout.addWidget(self.date_label)
 
+        # =====================================================
+        # COM PORT PICKER
+        # =====================================================
+
+        self.port_combo = QComboBox()
+        self.port_refresh_btn = QPushButton("Обновить")
+
+        self.port_refresh_btn.clicked.connect(self.populate_ports)
+        self.port_combo.activated[str].connect(self.on_port_selected)
+
+        port_row = QHBoxLayout()
+        port_row.addWidget(self.port_combo, stretch=1)
+        port_row.addWidget(self.port_refresh_btn)
+
+        right_layout.addWidget(QLabel("COM порт"))
+        right_layout.addLayout(port_row)
+
+        self.populate_ports()
+
         right_layout.addWidget(QLabel("Примечания"))
         right_layout.addWidget(self.comment_edit, stretch=1)
 
@@ -286,6 +359,46 @@ class MainApp(QMainWindow):
         container.setLayout(main_layout)
 
         self.setCentralWidget(container)
+
+    def populate_ports(self):
+
+        current = self.port_combo.currentText() if self.port_combo.count() else None
+
+        self.port_combo.blockSignals(True)
+        self.port_combo.clear()
+
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+
+        configured_port = self.cfg.get("mcu", "port", fallback="")
+        if configured_port and configured_port not in ports:
+            ports.append(configured_port)  # show it even if not currently plugged in
+
+        self.port_combo.addItems(ports)
+
+        to_select = current or configured_port
+        if to_select in ports:
+            self.port_combo.setCurrentText(to_select)
+
+        self.port_combo.blockSignals(False)
+
+    def on_port_selected(self, port_name):
+
+        if not port_name:
+            return
+
+        self.cfg.set("mcu", "port", port_name)
+        save_config(self.cfg)
+
+        if hasattr(self.mcu_thread, "request_port_change"):
+            self.mcu_thread.request_port_change(port_name)
+        else:
+            QMessageBox.warning(
+                self,
+                "Требуется перезапуск",
+                f"COM порт сохранён: {port_name}\n"
+                f"Живое переподключение недоступно в этой версии — "
+                f"перезапустите приложение."
+            )
 
     def open_data_folder(self):
 
@@ -322,6 +435,13 @@ class MainApp(QMainWindow):
         self.plot.nextRow()
         self.load_plot = self.plot.addPlot(title="Load")
         self.load_curve = self.load_plot.plot(pen="r")
+
+
+        pg.setConfigOptions(antialias=False)
+
+        for curve in [self.emg_curve, self.angle_curve, self.load_curve]:
+            curve.setDownsampling(auto=True, method='peak')
+            curve.setClipToView(True)
 
         # disable interaction
         for p in [self.emg_plot, self.angle_plot, self.load_plot]:
@@ -370,7 +490,10 @@ class MainApp(QMainWindow):
 
         self.start_event.set()
 
-        self.timer.start(30)
+        self.port_combo.setEnabled(False)
+        self.port_refresh_btn.setEnabled(False)
+
+        self.timer.start(50)   # was 30
 
         print("[START]")
 
@@ -411,6 +534,8 @@ class MainApp(QMainWindow):
 
     def _finish_stop(self):
         self.timer.stop()
+        self.port_combo.setEnabled(True)
+        self.port_refresh_btn.setEnabled(True)
         print("[STOP]")
         print("Saved in:", self.folder)
 

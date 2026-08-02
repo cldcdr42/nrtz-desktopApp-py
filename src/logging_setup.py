@@ -19,6 +19,18 @@ from utils import logs_dir
 
 _initialized = False
 
+# Third-party libraries that also use the stdlib logging module and
+# are extremely verbose at DEBUG level (matplotlib's font matching in
+# particular can produce hundreds of lines per plot). Silencing these
+# specifically keeps app.log at DEBUG for OUR code without drowning in
+# library internals. Add to this list if another library turns out to
+# be similarly noisy.
+_NOISY_LOGGERS = [
+    "matplotlib",
+    "PIL",
+    "urllib3",
+]
+
 
 def init_logging(filename: str = "app.log", level=logging.DEBUG) -> None:
     global _initialized
@@ -33,6 +45,9 @@ def init_logging(filename: str = "app.log", level=logging.DEBUG) -> None:
         level=level,
         format="%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s",
     )
+
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
     _initialized = True
 
