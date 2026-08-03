@@ -5,6 +5,9 @@ Application entry point and main GUI window (PyQt5). Wires together
 all the acquisition threads (LSL streams, MCU serial, UDP forwarding,
 CSV storage), owns the live plot, and handles session start/stop and
 recording-session bookkeeping (session folder, session_info.txt).
+
+GUI layout/widget construction lives in gui.py (GuiMixin) — this file
+owns thread wiring, recording control, and data handling only.
 """
 
 import sys
@@ -19,15 +22,10 @@ import time
 from logging_setup import init_logging
 init_logging()
 
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget,
-    QVBoxLayout, QPushButton, QLineEdit,
-    QTextEdit, QLabel, QMessageBox,
-    QFileDialog, QHBoxLayout, QComboBox
-)
+from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox, QFileDialog
 from PyQt5.QtCore import QTimer
-import pyqtgraph as pg
 
+from gui import GuiMixin
 
 from lsl_thread import LSLStreamWorker
 from mcu_thread import MCUThread
@@ -36,7 +34,6 @@ from udp_sender_thread import UDPSenderThread
 from plotter import plot_session_folder
 
 import serial.tools.list_ports
-from PyQt5.QtWidgets import QAction
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtCore import QUrl
 from config import load_config, save_config, settings_path
@@ -44,7 +41,7 @@ from utils import logs_dir
 from version import APP_NAME, APP_VERSION, get_build_date
 
 
-class MainApp(QMainWindow):
+class MainApp(QMainWindow, GuiMixin):
 
     def __init__(self):
         super().__init__()
@@ -66,23 +63,6 @@ class MainApp(QMainWindow):
         # -------------------------------------------------
         self.emg_plot_fs = 1000.0
         self.emg_plot_sample_index = 0
-
-        # For widget with info on the right
-        self.name_edit = QLineEdit()
-        self.name_edit.setText("Пациент 1")
-
-        self.session_edit = QLineEdit()
-        self.session_edit.setText("Номер 0")
-
-        self.date_label = QLabel()
-        self.date_label.setText(datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
-
-        self.comment_edit = QTextEdit()
-        self.comment_edit.setPlaceholderText(
-            "Для комментариев\n\n\n"
-            "Информация в полях участник, номер сеанса, время-дата и комментарии сохраняется "
-            "ТОЛЬКО при начале сеанса записи (нажатии кнопки старт)"
-        )
 
         # =====================================================
         # TIME BASE
@@ -140,6 +120,8 @@ class MainApp(QMainWindow):
             pull_timeout=0.5,
         )
 
+        self.lsl_workers = (self.lsl_data, self.lsl_raw_data, self.lsl_events, self.lsl_raw_events)
+
         self.cfg = load_config()
 
         mcu_port = self.cfg.get("mcu", "port", fallback="COM6")
@@ -164,7 +146,7 @@ class MainApp(QMainWindow):
         self.lsl_data.data.connect(self.on_emg)
         self.mcu_thread.data.connect(self.on_mcu)
 
-        # UI
+        # UI (built by GuiMixin, defined in gui.py)
         self.init_ui()
         self.init_menu()
         self.init_plot()
@@ -182,25 +164,16 @@ class MainApp(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plot)
 
+        # status panel timer — row counts + device connection state.
+        # Runs independently of the plot timer so status stays visible
+        # (e.g. "MCU not connected") even when not recording.
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.update_status_panel)
+        self.status_timer.start(1000)
+
     # =====================================================
-    # MENU
+    # MENU CALLBACKS
     # =====================================================
-
-    def init_menu(self):
-        menubar = self.menuBar()
-        help_menu = menubar.addMenu("Справка")
-
-        about_action = QAction("О программе", self)
-        about_action.triggered.connect(self.show_about)
-        help_menu.addAction(about_action)
-
-        open_log_action = QAction("Открыть лог-файл", self)
-        open_log_action.triggered.connect(self.open_log_file)
-        help_menu.addAction(open_log_action)
-
-        open_settings_action = QAction("Открыть файл настроек", self)
-        open_settings_action.triggered.connect(self.open_settings_file)
-        help_menu.addAction(open_settings_action)
 
     def show_about(self):
         QMessageBox.information(
@@ -263,6 +236,8 @@ class MainApp(QMainWindow):
         print("\n[SESSION START]")
         print(self.folder)
 
+        self.set_saved_to(self.folder)
+
     def get_folder(self):
         return self.folder
 
@@ -270,100 +245,8 @@ class MainApp(QMainWindow):
         return self.session_start
 
     # =====================================================
-    # UI
+    # PORT HANDLING
     # =====================================================
-
-    def init_ui(self):
-
-        self.setWindowTitle("Acquisition System")
-
-        # =====================================================
-        # BUTTONS
-        # =====================================================
-
-        start_btn = QPushButton("START")
-        stop_btn = QPushButton("STOP")
-        open_folder_btn = QPushButton("Открыть расположение сохраняемых файлов")
-        plot_session_btn = QPushButton("Построить график сохранённого сеанса")
-
-        start_btn.clicked.connect(self.start_recording)
-        stop_btn.clicked.connect(self.stop_recording)
-        open_folder_btn.clicked.connect(self.open_data_folder)
-        plot_session_btn.clicked.connect(self.open_plotter)
-
-        # =====================================================
-        # LEFT SIDE (plots + buttons)
-        # =====================================================
-
-        left_layout = QVBoxLayout()
-
-        left_layout.addWidget(start_btn)
-        left_layout.addWidget(stop_btn)
-        left_layout.addWidget(open_folder_btn)
-        left_layout.addWidget(plot_session_btn)
-
-        # plot widget gets inserted later in init_plot()
-        self.left_layout = left_layout
-
-        # =====================================================
-        # RIGHT SIDE (session info)
-        # =====================================================
-
-        right_layout = QVBoxLayout()
-
-        right_layout.addWidget(QLabel("Имя"))
-        right_layout.addWidget(self.name_edit)
-
-        right_layout.addWidget(QLabel("Номер сеанса"))
-        right_layout.addWidget(self.session_edit)
-
-        right_layout.addWidget(QLabel("Время проведения сеанса"))
-        right_layout.addWidget(self.date_label)
-
-        # =====================================================
-        # COM PORT PICKER
-        # =====================================================
-
-        self.port_combo = QComboBox()
-        self.port_refresh_btn = QPushButton("Обновить")
-
-        self.port_refresh_btn.clicked.connect(self.populate_ports)
-        self.port_combo.activated[str].connect(self.on_port_selected)
-
-        port_row = QHBoxLayout()
-        port_row.addWidget(self.port_combo, stretch=1)
-        port_row.addWidget(self.port_refresh_btn)
-
-        right_layout.addWidget(QLabel("COM порт"))
-        right_layout.addLayout(port_row)
-
-        self.populate_ports()
-
-        right_layout.addWidget(QLabel("Примечания"))
-        right_layout.addWidget(self.comment_edit, stretch=1)
-
-        right_layout.addStretch()
-
-        right_widget = QWidget()
-        right_widget.setLayout(right_layout)
-        right_widget.setMaximumWidth(300)
-
-        # =====================================================
-        # MAIN LAYOUT
-        # =====================================================
-
-        # left side = plots/buttons
-        left_widget = QWidget()
-        left_widget.setLayout(left_layout)
-
-        main_layout = QHBoxLayout()
-        main_layout.addWidget(left_widget, stretch=4)
-        main_layout.addWidget(right_widget, stretch=1)
-
-        container = QWidget()
-        container.setLayout(main_layout)
-
-        self.setCentralWidget(container)
 
     def populate_ports(self):
 
@@ -416,44 +299,6 @@ class MainApp(QMainWindow):
             subprocess.Popen(["explorer", path])
 
     # =====================================================
-    # PLOT SETUP
-    # =====================================================
-
-    def init_plot(self):
-
-        pg.setConfigOption("background", "w")
-        pg.setConfigOption("foreground", "k")
-
-        self.plot = pg.GraphicsLayoutWidget()
-        self.left_layout.addWidget(self.plot)
-
-        # EMG
-        self.emg_plot = self.plot.addPlot(title="EMG")
-        self.emg_curve = self.emg_plot.plot(pen="k")
-
-        # ANGLE
-        self.plot.nextRow()
-        self.angle_plot = self.plot.addPlot(title="Angle")
-        self.angle_curve = self.angle_plot.plot(pen="b")
-
-        # LOAD
-        self.plot.nextRow()
-        self.load_plot = self.plot.addPlot(title="Load")
-        self.load_curve = self.load_plot.plot(pen="r")
-
-        pg.setConfigOptions(antialias=False)
-
-        for curve in [self.emg_curve, self.angle_curve, self.load_curve]:
-            curve.setDownsampling(auto=True, method='peak')
-            curve.setClipToView(True)
-
-        # disable interaction
-        for p in [self.emg_plot, self.angle_plot, self.load_plot]:
-            p.setMouseEnabled(x=False, y=False)
-            p.hideButtons()
-            p.setMenuEnabled(False)
-
-    # =====================================================
     # CONTROL
     # =====================================================
 
@@ -478,7 +323,7 @@ class MainApp(QMainWindow):
         if hasattr(self.mcu_thread, "reset_sync"):
             self.mcu_thread.reset_sync()
 
-        for worker in (self.lsl_data, self.lsl_raw_data, self.lsl_events, self.lsl_raw_events):
+        for worker in self.lsl_workers:
             worker.reset_sync()
 
         # flush stale serial data
@@ -493,8 +338,8 @@ class MainApp(QMainWindow):
 
         self.start_event.set()
 
-        self.port_combo.setEnabled(False)
-        self.port_refresh_btn.setEnabled(False)
+        subject_label = f"{self.name_edit.text()} / {self.session_edit.text()}"
+        self.set_recording_ui_state(True, subject_label)
 
         self.timer.start(50)
 
@@ -537,8 +382,7 @@ class MainApp(QMainWindow):
 
     def _finish_stop(self):
         self.timer.stop()
-        self.port_combo.setEnabled(True)
-        self.port_refresh_btn.setEnabled(True)
+        self.set_recording_ui_state(False)
         print("[STOP]")
         print("Saved in:", self.folder)
 
@@ -687,6 +531,21 @@ class MainApp(QMainWindow):
                 print(f"[PLOT MCU ERROR] {e}")
 
     # =====================================================
+    # STATUS PANEL UPDATE (row counts + connection status)
+    # =====================================================
+
+    def update_status_panel(self):
+        row_counts = self.storage_thread.get_row_counts()
+        self.update_stream_status(row_counts)
+
+        mcu_connected = self.mcu_thread.is_connected()
+
+        lsl_connected_count = sum(1 for w in self.lsl_workers if w.is_connected())
+        lsl_total = len(self.lsl_workers)
+
+        self.update_device_status(mcu_connected, lsl_connected_count, lsl_total)
+
+    # =====================================================
     # CLEAN EXIT
     # =====================================================
 
@@ -697,10 +556,11 @@ class MainApp(QMainWindow):
 
         try:
             self.timer.stop()
+            self.status_timer.stop()
         except Exception:
             pass
 
-        for worker in (self.lsl_data, self.lsl_raw_data, self.lsl_events, self.lsl_raw_events):
+        for worker in self.lsl_workers:
             worker.stop()
 
         self.mcu_thread.stop()

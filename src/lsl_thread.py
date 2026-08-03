@@ -240,6 +240,10 @@ class LSLStreamWorker(QThread):
             traceback.print_exc()
             self.inlet = None
 
+    def is_connected(self):
+        """True if this stream currently has a live LSL inlet. Used by the GUI status panel."""
+        return self.inlet is not None
+
     def header(self):
         """
         Column header for this stream's CSV, sized to the actual

@@ -429,6 +429,11 @@ class MCUThread(QThread):
 
         log_print("[MCU ERROR] No usable serial port found")
 
+
+    def is_connected(self):
+        """True if the serial port is currently open. Used by the GUI status panel."""
+        return self.ser is not None and self.ser.is_open
+
     # =====================================================
     # PARSER
     # =====================================================

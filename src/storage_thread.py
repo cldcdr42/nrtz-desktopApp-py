@@ -56,6 +56,13 @@ class StorageThread(QThread):
         self._files = {}
         self._writers = {}
 
+        # key -> rows written so far this session. Reset whenever files
+        # are (re)opened for a new recording. Read by the GUI status
+        # panel via get_row_counts() to show live per-stream progress —
+        # this is the actual "is data being saved" signal, independent
+        # of whether a live plot happens to be moving.
+        self._row_counts = {}
+
         self.cycles_since_flush = 0
         self.flush_every_cycles = 20
 
@@ -116,6 +123,11 @@ class StorageThread(QThread):
         with self._lock:
             self.streams.pop(key, None)
             self._header_written.pop(key, None)
+
+    def get_row_counts(self):
+        """Thread-safe snapshot of rows written per stream this session, for the GUI status panel."""
+        with self._lock:
+            return dict(self._row_counts)
 
     # =====================================================
     # MAIN LOOP
@@ -191,6 +203,11 @@ class StorageThread(QThread):
 
         self.cycles_since_flush = 0
 
+        # Fresh row counters for the new session, one per stream open
+        # right now — get_row_counts() reflects this session only.
+        with self._lock:
+            self._row_counts = {key: 0 for key, _ in self.streams.items()}
+
         print("[STORAGE] files opened:",
               [cfg["filename"] for _, cfg in self._snapshot_streams()])
 
@@ -205,6 +222,8 @@ class StorageThread(QThread):
         for key, cfg in self._snapshot_streams():
             if key not in self._files:
                 self._open_file_for(key, cfg, folder)
+                with self._lock:
+                    self._row_counts.setdefault(key, 0)
                 print(f"[STORAGE] late-opened stream '{key}' -> {cfg['filename']}")
 
     def flush_some(self):
@@ -240,6 +259,9 @@ class StorageThread(QThread):
                 writer.writerow(row)
                 written += 1
 
+                with self._lock:
+                    self._row_counts[key] = self._row_counts.get(key, 0) + 1
+
         self.cycles_since_flush += 1
 
         if self.cycles_since_flush >= self.flush_every_cycles:
@@ -274,6 +296,9 @@ class StorageThread(QThread):
 
                         writer.writerow(row)
                         any_written = True
+
+                        with self._lock:
+                            self._row_counts[key] = self._row_counts.get(key, 0) + 1
                 except Empty:
                     pass
                 except Exception as e:
