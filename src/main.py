@@ -6,6 +6,10 @@ all the acquisition threads (LSL streams, MCU serial, UDP forwarding,
 CSV storage), owns the live plot, and handles session start/stop and
 recording-session bookkeeping (session folder, session_info.txt).
 
+Every recording starts with a per-trial load-cell calibration step
+(LoadCalibrationDialog, gui.py) before the real session/timer/CSV
+writing begins — see start_recording() below.
+
 GUI layout/widget construction lives in gui.py (GuiMixin) — this file
 owns thread wiring, recording control, and data handling only.
 """
@@ -22,10 +26,10 @@ import time
 from logging_setup import init_logging
 init_logging()
 
-from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox, QFileDialog
+from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox, QFileDialog, QDialog
 from PyQt5.QtCore import QTimer
 
-from gui import GuiMixin
+from gui import GuiMixin, LoadCalibrationDialog
 
 from lsl_thread import LSLStreamWorker
 from mcu_thread import MCUThread
@@ -54,6 +58,15 @@ class MainApp(QMainWindow, GuiMixin):
         self.folder = None
 
         self.window_size = 10
+
+        # Set by the calibration dialog in start_recording(), before
+        # create_session() writes them into session_info.txt.
+        self._last_calibration_skipped = False
+        self._last_zero = None
+        self._last_peak_pos = None
+        self._last_peak_neg = None
+        self._last_span_pos = None
+        self._last_span_neg = None
 
         # -------------------------------------------------
         # EMG LIVE PLOT DISPLAY SETTINGS
@@ -126,8 +139,9 @@ class MainApp(QMainWindow, GuiMixin):
 
         mcu_port = self.cfg.get("mcu", "port", fallback="COM6")
         mcu_baud = self.cfg.getint("mcu", "baud", fallback=115200)
+        load_default_span = self.cfg.getfloat("load_cell", "default_span", fallback=500000.0)
 
-        self.mcu_thread = MCUThread(mcu_port, mcu_baud, self.start_event)
+        self.mcu_thread = MCUThread(mcu_port, mcu_baud, self.start_event, default_span=load_default_span)
         self.udp_thread = UDPSenderThread(self.start_event)
 
         self.mcu_thread.raw.connect(self.udp_thread.on_data)
@@ -225,6 +239,25 @@ class MainApp(QMainWindow, GuiMixin):
             f.write(f"Номер сеанса: {self.session_edit.text()}\n")
             f.write("\n")
 
+            if self._last_calibration_skipped:
+                f.write(
+                    "Калибровка нагрузки: пропущена, используются значения по умолчанию.\n"
+                    f"Ноль: устанавливается автоматически при старте записи.\n"
+                    f"Span (по умолчанию): {self.mcu_thread.LOAD_SPAN:.0f}\n"
+                )
+            else:
+                f.write(
+                    f"Калибровка нагрузки:\n"
+                    f"  Ноль: {self._last_zero:.0f}\n"
+                    f"  Макс. усилие, направление 1 (пик): "
+                    f"{self._last_peak_pos if self._last_peak_pos is not None else 'н/д'}\n"
+                    f"  Макс. усилие, направление 2 (пик): "
+                    f"{self._last_peak_neg if self._last_peak_neg is not None else 'н/д'}\n"
+                    f"  Применённый span (+): {self._last_span_pos:.0f}\n"
+                    f"  Применённый span (-): {self._last_span_neg:.0f}\n"
+                )
+            f.write("\n")
+
             f.write("Комментарии:\n")
             f.write(self.comment_edit.toPlainText())
             f.write("\n\n")
@@ -304,29 +337,10 @@ class MainApp(QMainWindow, GuiMixin):
 
     def start_recording(self):
 
-        self.start_event.clear()
-        self.reset_buffers()
-
-        self.recording = True
-
-        # IMPORTANT:
-        # real samples define session zero
-        self.session_start = time.perf_counter()
-        self.emg_start_time = None
-
-        # Update visible date at recording start
-        self.date_label.setText(datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
-
-        self.create_session()
-
-        # reset synchronization / baselines
-        if hasattr(self.mcu_thread, "reset_sync"):
-            self.mcu_thread.reset_sync()
-
-        for worker in self.lsl_workers:
-            worker.reset_sync()
-
-        # flush stale serial data
+        # -------------------------------------------------
+        # Flush any stale serial data before anything reads it —
+        # including the calibration dialog below.
+        # -------------------------------------------------
         if self.mcu_thread.ser is not None:
 
             try:
@@ -336,7 +350,72 @@ class MainApp(QMainWindow, GuiMixin):
             except Exception as e:
                 print(f"[MCU FLUSH ERROR] {e}")
 
+        self.reset_buffers()
+
+        # -------------------------------------------------
+        # Let MCU/LSL threads start actively reading/emitting so the
+        # calibration dialog can show live raw values — but hold off
+        # on self.recording=True (and therefore on StorageThread
+        # actually opening/writing files) until the dialog is
+        # resolved one way or another.
+        # -------------------------------------------------
         self.start_event.set()
+
+        calibration = LoadCalibrationDialog(self.mcu_thread, parent=self)
+        result = calibration.exec_()
+
+        if result != QDialog.Accepted:
+            # Operator hit Cancel or Esc -> abort start entirely.
+            self.start_event.clear()
+            print("[START] cancelled at calibration dialog")
+            return
+
+        pos_peak, neg_peak = calibration.get_calibration()
+        self.mcu_thread.set_load_calibration(pos_peak, neg_peak)
+
+        self._last_calibration_skipped = calibration.calibration_skipped
+        self._last_zero = calibration.zero_value
+        self._last_peak_pos = pos_peak
+        self._last_peak_neg = neg_peak
+        # Read the *applied* spans back from mcu_thread rather than
+        # recomputing the 2x headroom here — single source of truth
+        # for what's actually used during normalization.
+        self._last_span_pos = self.mcu_thread.load_span_pos
+        self._last_span_neg = self.mcu_thread.load_span_neg
+
+        # Discard whatever samples accumulated during the dialog —
+        # that data was never meant to be part of the saved trial.
+        self.reset_buffers()
+
+        # IMPORTANT:
+        # real samples define session zero
+        self.session_start = time.perf_counter()
+        self.emg_start_time = None
+
+        # Update visible date at recording start
+        self.date_label.setText(datetime.now().strftime("%d/%m/%Y %H:%M:%S"))
+
+        # create_session() must run BEFORE self.recording flips True --
+        # self.folder has to already point at the NEW session's folder
+        # by the time StorageThread (polling independently on its own
+        # thread) is allowed to start opening/writing files. Flipping
+        # self.recording first left a real window where self.folder
+        # still held the PREVIOUS session's path, causing StorageThread
+        # to silently write the whole trial into the wrong folder.
+        self.create_session()
+
+        self.recording = True
+
+        # reset_zero=False: the zero baseline was just established
+        # (explicitly by calibration, or intentionally left for
+        # MCUThread's own auto-zero if defaults were chosen) — don't
+        # let this wipe it. Everything else (was_recording, debug
+        # counters) still resets normally.
+        if hasattr(self.mcu_thread, "reset_sync"):
+            self.mcu_thread.reset_sync(reset_zero=False)
+
+        for worker in self.lsl_workers:
+            worker.reset_sync()
 
         subject_label = f"{self.name_edit.text()} / {self.session_edit.text()}"
         self.set_recording_ui_state(True, subject_label)

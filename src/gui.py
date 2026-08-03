@@ -12,15 +12,20 @@ defines how they look in each state — it does not own any
 recording/session logic itself; the methods it calls out to
 (start_recording, populate_ports, show_about, etc.) are implemented
 in main.py.
+
+Also home to LoadCalibrationDialog, the per-trial load-cell
+calibration wizard shown at the start of every recording (see
+main.py's start_recording()): an explicit zero step, followed by a
+two-direction max-pull capture, or a skip-to-defaults path.
 """
 
 from datetime import datetime
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLineEdit, QTextEdit, QLabel,
-    QGroupBox, QComboBox, QAction
+    QGroupBox, QComboBox, QAction, QDialog
 )
 import pyqtgraph as pg
 
@@ -341,3 +346,318 @@ class GuiMixin:
 
     def set_saved_to(self, folder):
         self.saved_to_label.setText(f"Сохранено в: {folder}" if folder else "")
+
+
+class LoadCalibrationDialog(QDialog):
+    """
+    Per-trial load-cell calibration wizard, run at the start of every
+    recording (the rig gets re-mounted per subject/arm, so this can't
+    be a once-and-saved calibration).
+
+    Flow:
+      choice        -> Calibrate / Use default values / Cancel
+      zero_wait      -> "hand off the sensor, press SPACE" (Calibrate only)
+      zero_capturing -> 5s automatic average of raw values -> zero established
+      zero_done      -> shows the zero value, "press SPACE to continue"
+      wait1 / cap1   -> direction 1 max-pull capture (existing spacebar-gated flow)
+      wait2 / cap2   -> direction 2 max-pull capture
+      done           -> shows both peaks, "press SPACE to start recording"
+
+    "Use default values" skips straight to accept() without touching
+    load_zero at all — MCUThread's own silent auto-zero (unlocked on
+    the way out) picks it up exactly as it did before calibration
+    existed.
+
+    While this dialog is open, mcu_thread.load_zero_locked is held
+    True so MCUThread's background auto-zero can't race the explicit
+    zero step above — see mcu_thread.py.
+    """
+
+    ZERO_SECONDS = 5.0
+    CAPTURE_SECONDS = 2.5
+
+    def __init__(self, mcu_thread, parent=None):
+        super().__init__(parent)
+
+        self.mcu_thread = mcu_thread
+
+        self.stage = "choice"
+        self.zero_value = None
+        self._zero_samples = []
+        self.peak_dir1 = None
+        self.peak_dir2 = None
+        self._current_peak = None
+        self.calibration_skipped = False
+
+        # Hold off MCUThread's own silent auto-zero for the whole
+        # time this dialog is open — see class docstring.
+        self.mcu_thread.load_zero_locked = True
+        self.mcu_thread.load_zero = None
+        self.mcu_thread.load_zero_samples = []
+
+        self.setWindowTitle("Калибровка датчика нагрузки")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+
+        self.instruction_label = QLabel(
+            "Выполнить калибровку датчика нагрузки перед этим сеансом?"
+        )
+        self.instruction_label.setWordWrap(True)
+        self.instruction_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+
+        self.readout_label = QLabel("")
+        self.readout_label.setStyleSheet("color: gray;")
+
+        self.result_label = QLabel("")
+        self.result_label.setWordWrap(True)
+
+        # -------------------------------------------------
+        # Choice buttons — only visible on the initial screen.
+        # NoFocus + no auto-default so a later Space press (used for
+        # the actual capture flow) can never accidentally trigger one
+        # of these via button-focus space-activation.
+        # -------------------------------------------------
+        self.calibrate_btn = QPushButton("Откалибровать")
+        self.defaults_btn = QPushButton("Значения по умолчанию")
+        self.cancel_btn = QPushButton("Отмена")
+
+        for btn in (self.calibrate_btn, self.defaults_btn, self.cancel_btn):
+            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+
+        self.calibrate_btn.clicked.connect(self._start_calibration)
+        self.defaults_btn.clicked.connect(self._use_defaults)
+        self.cancel_btn.clicked.connect(self.reject)
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.calibrate_btn)
+        button_row.addWidget(self.defaults_btn)
+        button_row.addWidget(self.cancel_btn)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.instruction_label)
+        layout.addWidget(self.readout_label)
+        layout.addWidget(self.result_label)
+        layout.addLayout(button_row)
+        self.setLayout(layout)
+
+        self.capture_timer = QTimer(self)
+        self.capture_timer.setSingleShot(True)
+        self.capture_timer.timeout.connect(self._on_timer_done)
+
+        self.mcu_thread.data.connect(self._on_data)
+
+    # -------------------------------------------------
+    # CHOICE SCREEN ACTIONS
+    # -------------------------------------------------
+
+    def _start_calibration(self):
+        self.calibrate_btn.hide()
+        self.defaults_btn.hide()
+        # cancel_btn stays visible/available for the whole flow
+
+        self.stage = "zero_wait"
+        self.instruction_label.setText(
+            "Уберите руку/груз с датчика.\n"
+            "Нажмите ПРОБЕЛ, чтобы установить ноль (5 секунд)."
+        )
+        self.readout_label.setText("")
+
+    def _use_defaults(self):
+        self.calibration_skipped = True
+        # Deliberately leave load_zero alone (still None) and unlock
+        # -- MCUThread's own silent auto-zero takes over from here,
+        # exactly as it did before per-trial calibration existed.
+        self.mcu_thread.load_zero_locked = False
+        self.accept()
+
+    # -------------------------------------------------
+    # ZERO STEP
+    # -------------------------------------------------
+
+    def _begin_zero_capture(self):
+        self.stage = "zero_capturing"
+        self._zero_samples = []
+        self.instruction_label.setText("Установка нуля... не трогайте датчик.")
+        self.capture_timer.start(int(self.ZERO_SECONDS * 1000))
+
+    def _finish_zero_capture(self):
+
+        if self._zero_samples:
+            self.zero_value = sum(self._zero_samples) / len(self._zero_samples)
+        else:
+            # No samples arrived during the window (e.g. MCU not
+            # connected) -- fall back to 0.0 rather than crashing;
+            # the resulting calibration will be meaningless, but the
+            # operator can see that from the live readout staying
+            # blank and cancel/retry.
+            self.zero_value = 0.0
+
+        self.mcu_thread.set_load_zero(self.zero_value)
+
+        self._append_result(f"Ноль установлен: {self.zero_value:.0f}")
+        self.stage = "zero_done"
+        self.instruction_label.setText(
+            "Ноль установлен. Нажмите ПРОБЕЛ, чтобы продолжить калибровку усилия."
+        )
+        self.readout_label.setText("")
+
+    # -------------------------------------------------
+    # MAX-PULL CAPTURE (direction 1 / direction 2)
+    # -------------------------------------------------
+
+    def _show_waiting_prompt(self):
+        direction_num = 1 if self.stage == "wait1" else 2
+        self.instruction_label.setText(
+            f"Направление {direction_num}: максимальное усилие.\n"
+            f"Нажмите ПРОБЕЛ, когда участник готов тянуть."
+        )
+        self.readout_label.setText("Текущее значение: —")
+
+    def _begin_capture(self):
+        self.stage = "cap1" if self.stage == "wait1" else "cap2"
+        self._current_peak = None
+
+        direction_num = 1 if self.stage == "cap1" else 2
+        self.instruction_label.setText(f"Направление {direction_num}: тяните сейчас!")
+
+        self.capture_timer.start(int(self.CAPTURE_SECONDS * 1000))
+
+    def _finish_capture(self):
+
+        if self.stage == "cap1":
+            self.peak_dir1 = self._current_peak
+            self._append_result(f"Направление 1: пик = {self._fmt(self.peak_dir1)}")
+            self.stage = "wait2"
+            self._show_waiting_prompt()
+
+        elif self.stage == "cap2":
+            self.peak_dir2 = self._current_peak
+            self._append_result(f"Направление 2: пик = {self._fmt(self.peak_dir2)}")
+            self.stage = "done"
+            # Calibration flow complete -- load_zero is already set,
+            # so the lock no longer matters, but clear it for
+            # cleanliness/consistency with the other exit paths.
+            self.mcu_thread.load_zero_locked = False
+            self.instruction_label.setText(
+                "Калибровка завершена. Нажмите ПРОБЕЛ, чтобы начать запись."
+            )
+            self.readout_label.setText("")
+
+    # -------------------------------------------------
+    # SHARED TIMER DISPATCH
+    # -------------------------------------------------
+
+    def _on_timer_done(self):
+        if self.stage == "zero_capturing":
+            self._finish_zero_capture()
+        elif self.stage in ("cap1", "cap2"):
+            self._finish_capture()
+
+    def _append_result(self, line):
+        current = self.result_label.text()
+        self.result_label.setText(f"{current}\n{line}" if current else line)
+
+    @staticmethod
+    def _fmt(value):
+        return "—" if value is None else f"{value:.0f}"
+
+    # -------------------------------------------------
+    # DATA / INPUT
+    # -------------------------------------------------
+
+    def _on_data(self, pc_perf_ts, mcu_ts, angle_raw, angle, load_raw, load_norm):
+
+        if self.stage == "zero_capturing":
+            self._zero_samples.append(load_raw)
+            self.readout_label.setText(f"Текущее сырое значение: {load_raw:.0f}")
+            return
+
+        if self.stage not in ("cap1", "cap2"):
+            return
+
+        zero = self.mcu_thread.load_zero
+
+        if zero is None:
+            # Shouldn't happen at this point (zero step already ran
+            # before cap1/cap2 becomes reachable) -- guard anyway.
+            return
+
+        corrected = load_raw - zero
+        self.readout_label.setText(f"Текущее значение: {corrected:.0f}")
+
+        if self._current_peak is None or abs(corrected) > abs(self._current_peak):
+            self._current_peak = corrected
+
+    def keyPressEvent(self, event):
+
+        if event.key() != Qt.Key_Space:
+            super().keyPressEvent(event)
+            return
+
+        if self.stage == "zero_wait":
+            self._begin_zero_capture()
+
+        elif self.stage == "zero_done":
+            self.stage = "wait1"
+            self._show_waiting_prompt()
+
+        elif self.stage in ("wait1", "wait2"):
+
+            if self.mcu_thread.load_zero is None:
+                self.instruction_label.setText(
+                    self.instruction_label.text() +
+                    "\n(Ноль ещё не установлен, подождите...)"
+                )
+                return
+
+            self._begin_capture()
+
+        elif self.stage == "done":
+            self.accept()
+
+        # Space does nothing on the "choice" screen — deliberate,
+        # button-driven only, so a stray spacebar press can't
+        # accidentally start or skip calibration before the operator
+        # has read the prompt.
+
+    def reject(self):
+        # Operator cancelled (button or Esc) at any stage -- make
+        # sure MCUThread isn't left permanently locked out of its own
+        # auto-zero.
+        self.mcu_thread.load_zero_locked = False
+        super().reject()
+
+    def closeEvent(self, event):
+        self.mcu_thread.load_zero_locked = False
+        try:
+            self.mcu_thread.data.disconnect(self._on_data)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    # -------------------------------------------------
+    # RESULT
+    # -------------------------------------------------
+
+    def get_calibration(self):
+        """
+        Returns (pos_peak, neg_peak) — measured peak raw deviations
+        from zero for whichever direction came out positive/negative
+        (not raw capture order), or (None, None) if calibration was
+        skipped. mcu_thread.set_load_calibration() applies the 2x
+        headroom multiplier to turn these into actual spans.
+        """
+        if self.calibration_skipped:
+            return None, None
+
+        peaks = [p for p in (self.peak_dir1, self.peak_dir2) if p is not None]
+
+        pos_candidates = [p for p in peaks if p >= 0]
+        neg_candidates = [p for p in peaks if p < 0]
+
+        pos_peak = max(pos_candidates) if pos_candidates else None
+        neg_peak = abs(min(neg_candidates)) if neg_candidates else None
+
+        return pos_peak, neg_peak

@@ -4,7 +4,9 @@ mcu_thread.py
 Serial acquisition worker for the MCU (Arduino) sending angle/load
 sensor data over a COM port as JSON lines. Handles connecting/
 reconnecting to the serial port, parsing each line, normalizing the
-HX711 load cell reading to a -1..+1 range, and forwarding both parsed
+HX711 load cell reading against a per-trial calibrated span (see
+set_load_calibration()/set_load_zero(), driven by the calibration
+dialog in gui.py before each recording), and forwarding both parsed
 data (for plotting/CSV) and raw JSON (for UDP forwarding) via signals.
 """
 
@@ -14,6 +16,10 @@ import serial
 import serial.tools.list_ports
 import time
 import json
+import traceback
+import logging
+import sys
+from pathlib import Path
 
 from logging_setup import log_print, log_exception
 
@@ -26,7 +32,7 @@ class MCUThread(QThread):
     # raw JSON line for UDP forwarding
     raw = pyqtSignal(str)
 
-    def __init__(self, port, baud, start_event):
+    def __init__(self, port, baud, start_event, default_span=500000.0):
 
         super().__init__()
 
@@ -54,10 +60,36 @@ class MCUThread(QThread):
         # At 10 Hz:
         # 5 samples = about 0.5 seconds.
         # During these first samples, load output is 0.0.
+        # This silent auto-zero only actually runs when load_zero is
+        # None AND load_zero_locked is False -- see run() below. It's
+        # the "use default values" fallback path (no explicit
+        # calibration dialog zero step), kept as the original
+        # behavior for that case.
         self.load_zero_sample_count = 5
 
-        # Raw load difference that maps to +1 or -1.
-        self.LOAD_SPAN = 500000.0
+        # While True, the auto-zero block in run() does nothing, even
+        # if load_zero is still None. Set by the calibration dialog
+        # for the entire time it's open, so its own explicit 5-second
+        # zero step (or its decision to fall back to auto-zero) can't
+        # be raced by this thread quietly zeroing itself in the
+        # background first.
+        self.load_zero_locked = False
+
+        # Fallback span (raw units mapping to +-1.0), sourced from
+        # settings.ini via main.py, used only when a per-trial
+        # calibration hasn't been set via set_load_calibration() --
+        # e.g. the operator chose "use default values".
+        self.LOAD_SPAN = float(default_span)
+
+        # Per-direction spans, set from the max-pull calibration
+        # dialog before each trial (see gui.py LoadCalibrationDialog
+        # and set_load_calibration() below). Both are positive
+        # magnitudes, already include the 2x calibration-to-clamp
+        # headroom (see set_load_calibration). Not reset by
+        # reset_sync() — calibration is a property of "this trial's
+        # setup", separate from the zero baseline.
+        self.load_span_pos = self.LOAD_SPAN
+        self.load_span_neg = self.LOAD_SPAN
 
         # ----------------------------------------
         # Debug counters
@@ -208,22 +240,41 @@ class MCUThread(QThread):
 
                 if self.load_zero is None:
 
-                    self.load_zero_samples.append(load)
+                    # Silent auto-zero fallback — only actually runs
+                    # when not locked. The calibration dialog locks
+                    # this for its entire lifetime and either sets
+                    # load_zero explicitly (Calibrate) or unlocks
+                    # this on its way out without setting it (Use
+                    # defaults), letting this run exactly as it did
+                    # before per-trial calibration existed.
+                    if not self.load_zero_locked:
 
-                    if len(self.load_zero_samples) >= self.load_zero_sample_count:
-                        self.load_zero = (
-                            sum(self.load_zero_samples)
-                            / len(self.load_zero_samples)
-                        )
+                        self.load_zero_samples.append(load)
 
-                        log_print(f"[LOAD ZERO] {self.load_zero:.3f}")
+                        if len(self.load_zero_samples) >= self.load_zero_sample_count:
+                            self.load_zero = (
+                                sum(self.load_zero_samples)
+                                / len(self.load_zero_samples)
+                            )
+
+                            log_print(f"[LOAD ZERO] {self.load_zero:.3f}")
 
                     load_norm = 0.0
 
                 else:
 
                     load_corrected = load - self.load_zero
-                    load_norm = load_corrected / self.LOAD_SPAN
+
+                    # Asymmetric per-direction span: the rig measures
+                    # forearm pull strength, which differs between
+                    # directions (different arm, different subject) —
+                    # a single symmetric span would misrepresent one
+                    # side. Spans come from the per-trial calibration
+                    # dialog via set_load_calibration(); until that's
+                    # been run, both default to LOAD_SPAN.
+                    span = self.load_span_pos if load_corrected >= 0 else self.load_span_neg
+
+                    load_norm = (load_corrected / span) if span else 0.0
 
                     if load_norm < -1.0:
                         load_norm = -1.0
@@ -292,6 +343,60 @@ class MCUThread(QThread):
             log_print(f"[MCU DEBUG] {extra}")
 
         self.last_debug_report_time = now
+
+    # =====================================================
+    # LOAD CALIBRATION (driven externally, from gui.py's
+    # LoadCalibrationDialog, before each trial)
+    # =====================================================
+
+    def set_load_zero(self, zero_value):
+        """
+        Explicitly sets the zero baseline, bypassing the silent
+        auto-zero. Called by the calibration dialog after its
+        dedicated 5-second "hand off the sensor" step, using an
+        average of raw samples collected over that window (more
+        stable than the old quick 5-sample average).
+        """
+        self.load_zero = zero_value
+        self.load_zero_samples = []
+        log_print(f"[MCU] Load zero set explicitly: {zero_value:.3f}")
+
+    def set_load_calibration(self, pos_peak, neg_peak):
+        """
+        Set per-direction max-pull spans from a calibration dialog.
+        pos_peak / neg_peak are the measured peak raw deviations from
+        zero during each direction's capture window (not spans
+        themselves) — the actual span used for normalization is
+        2x that peak, so a real effort matching the exact calibrated
+        max lands at load_norm=0.5, not 1.0, leaving headroom for a
+        harder pull later in the trial without clamping/losing data.
+        Genuinely exceeding 2x the calibrated peak still clamps to
+        +-1.0 — this just moves the ceiling up, not removes it.
+
+        Either argument may be None (that direction's calibration
+        capture never registered a reading) — falls back to
+        LOAD_SPAN for that direction rather than leaving it unset.
+        """
+
+        CALIBRATION_HEADROOM = 2.0
+
+        if pos_peak is not None and pos_peak > 0:
+            self.load_span_pos = CALIBRATION_HEADROOM * pos_peak
+        else:
+            self.load_span_pos = self.LOAD_SPAN
+            log_print("[MCU] No positive-direction calibration captured, using default span")
+
+        if neg_peak is not None and neg_peak > 0:
+            self.load_span_neg = CALIBRATION_HEADROOM * neg_peak
+        else:
+            self.load_span_neg = self.LOAD_SPAN
+            log_print("[MCU] No negative-direction calibration captured, using default span")
+
+        log_print(
+            f"[MCU] Load calibration set: "
+            f"pos_span={self.load_span_pos:.0f} (peak={pos_peak}), "
+            f"neg_span={self.load_span_neg:.0f} (peak={neg_peak})"
+        )
 
     # =====================================================
     # LIVE PORT CHANGE (requested from GUI thread)
@@ -429,11 +534,6 @@ class MCUThread(QThread):
 
         log_print("[MCU ERROR] No usable serial port found")
 
-
-    def is_connected(self):
-        """True if the serial port is currently open. Used by the GUI status panel."""
-        return self.ser is not None and self.ser.is_open
-
     # =====================================================
     # PARSER
     # =====================================================
@@ -504,12 +604,27 @@ class MCUThread(QThread):
     # SYNC / BASELINE RESET
     # =====================================================
 
-    def reset_sync(self):
+    def reset_sync(self, reset_zero=True):
+        """
+        Resets sync/debug state for a fresh trial.
+
+        reset_zero=True (default) restores the original behavior:
+        clears load_zero so the next samples re-establish it. Pass
+        reset_zero=False after a calibration dialog run — whether it
+        set an explicit zero (Calibrate) or deliberately left it to
+        be auto-set on the next samples (Use defaults) — so this
+        call doesn't undo that decision.
+
+        Never touches load_span_pos/load_span_neg — those come from
+        set_load_calibration() and represent a separate, already
+        completed step for this trial.
+        """
 
         self.was_recording = False
 
-        self.load_zero = None
-        self.load_zero_samples = []
+        if reset_zero:
+            self.load_zero = None
+            self.load_zero_samples = []
 
         self.raw_count = 0
         self.valid_count = 0
@@ -521,7 +636,7 @@ class MCUThread(QThread):
         self.last_debug_report_time = time.monotonic()
         self.last_empty_warning_time = time.monotonic()
 
-        log_print("[MCU DEBUG] reset_sync() called")
+        log_print(f"[MCU DEBUG] reset_sync() called (reset_zero={reset_zero})")
 
     # =====================================================
     # STOP
@@ -544,3 +659,11 @@ class MCUThread(QThread):
         self.wait(1000)
 
         log_print("[MCU DEBUG] stop() finished")
+
+    # =====================================================
+    # STATUS (for GUI status panel)
+    # =====================================================
+
+    def is_connected(self):
+        """True if the serial port is currently open. Used by the GUI status panel."""
+        return self.ser is not None and self.ser.is_open

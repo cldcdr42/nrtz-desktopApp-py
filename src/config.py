@@ -33,6 +33,16 @@ DEFAULTS = {
         "refresh_ms": "50",
         "window_seconds": "10",
     },
+    "load_cell": {
+        # Fallback span (raw units mapping to +-1.0), used whenever a
+        # per-trial calibration isn't run -- either the operator chose
+        # "use default values" in the calibration dialog, or one
+        # direction's capture never registered a reading. Since the
+        # rig is asymmetric and gets re-mounted per subject, this is
+        # deliberately a rough one-size-fits-all fallback, not meant
+        # to replace real per-trial calibration.
+        "default_span": "500000",
+    },
 }
 
 

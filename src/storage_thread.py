@@ -196,6 +196,21 @@ class StorageThread(QThread):
         if folder is None:
             return
 
+        # Defensive: if this folder already has files open from a
+        # PREVIOUS session (active was True, then flipped False/True
+        # again without close_files() running in between — shouldn't
+        # happen, but this is exactly the kind of bug that silently
+        # lost data before), refuse to silently write into it and log
+        # loudly instead of guessing.
+        if self._files:
+            log_print_fallback = print  # storage_thread.py doesn't import log_print; using print is consistent with its existing style
+            log_print_fallback(
+                f"[STORAGE ERROR] open_all_files() called with files already open "
+                f"({list(self._files.keys())}) -- closing them first to avoid writing "
+                f"into the wrong session folder."
+            )
+            self.close_files()
+
         folder.mkdir(parents=True, exist_ok=True)
 
         for key, cfg in self._snapshot_streams():
