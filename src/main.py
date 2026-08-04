@@ -565,12 +565,22 @@ class MainApp(QMainWindow, GuiMixin):
             return
 
         # ---------------- EMG ----------------
+        # trim_many() keeps t_emg/v_emg the same length, so under
+        # normal operation n_emg == len(self.t_emg) and the old
+        # t_emg[-n_emg:] slice was a full copy of the buffer (up to
+        # 5000 elements) on every single tick of this 20Hz timer --
+        # pure overhead. Only actually slice on the rare/defensive
+        # case where the two buffers have drifted out of sync.
         n_emg = min(len(self.t_emg), len(self.v_emg))
 
         if n_emg > 1:
 
-            t_emg = self.t_emg[-n_emg:]
-            v_emg = self.v_emg[-n_emg:]
+            if n_emg == len(self.t_emg) and n_emg == len(self.v_emg):
+                t_emg = self.t_emg
+                v_emg = self.v_emg
+            else:
+                t_emg = self.t_emg[-n_emg:]
+                v_emg = self.v_emg[-n_emg:]
 
             try:
                 self.emg_curve.setData(t_emg, v_emg)
@@ -586,13 +596,21 @@ class MainApp(QMainWindow, GuiMixin):
                 print(f"[PLOT EMG ERROR] {e}")
 
         # ---------------- MCU ----------------
+        # Same reasoning as the EMG block above -- avoid copying all
+        # three buffers every tick when they're already the length
+        # being plotted.
         n_mcu = min(len(self.t_mcu), len(self.angle), len(self.load))
 
         if n_mcu > 1:
 
-            t_mcu = self.t_mcu[-n_mcu:]
-            angle = self.angle[-n_mcu:]
-            load = self.load[-n_mcu:]
+            if n_mcu == len(self.t_mcu) and n_mcu == len(self.angle) and n_mcu == len(self.load):
+                t_mcu = self.t_mcu
+                angle = self.angle
+                load = self.load
+            else:
+                t_mcu = self.t_mcu[-n_mcu:]
+                angle = self.angle[-n_mcu:]
+                load = self.load[-n_mcu:]
 
             try:
                 self.angle_curve.setData(t_mcu, angle)

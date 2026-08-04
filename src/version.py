@@ -17,7 +17,7 @@ from pathlib import Path
 from utils import is_frozen
 
 APP_NAME = "nrtz-desktopApp"
-APP_VERSION = "0.2.5"
+APP_VERSION = "0.3.0"
 
 
 def get_build_date() -> str:

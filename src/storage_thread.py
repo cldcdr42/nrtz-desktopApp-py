@@ -252,30 +252,36 @@ class StorageThread(QThread):
 
             q = cfg["queue"]
             limit = cfg.get("max_rows_per_cycle", 500)
-            written = 0
 
-            # Capped per stream per cycle, so one very high-rate stream
-            # can't starve the others (or the flush check below) if its
-            # queue backs up.
-            while written < limit:
+            # Drain up to `limit` rows into a plain list first, then
+            # hand them to csv.writer in one writerows() call, instead
+            # of one writerow() call per row. Same cap semantics as
+            # before (one very high-rate stream still can't starve the
+            # others), just fewer individual Python-level csv calls
+            # for the high-rate LSL streams.
+            batch = []
+
+            while len(batch) < limit:
                 try:
-                    row = q.get_nowait()
+                    batch.append(q.get_nowait())
                 except Empty:
                     break
                 except Exception as e:
                     print(f"[STORAGE {key} ERROR] {e}")
                     break
 
-                if not self._header_written.get(key, True):
-                    generic_header = [f"col_{i}" for i in range(len(row))]
-                    writer.writerow(generic_header)
-                    self._header_written[key] = True
+            if not batch:
+                continue
 
-                writer.writerow(row)
-                written += 1
+            if not self._header_written.get(key, True):
+                generic_header = [f"col_{i}" for i in range(len(batch[0]))]
+                writer.writerow(generic_header)
+                self._header_written[key] = True
 
-                with self._lock:
-                    self._row_counts[key] = self._row_counts.get(key, 0) + 1
+            writer.writerows(batch)
+
+            with self._lock:
+                self._row_counts[key] = self._row_counts.get(key, 0) + len(batch)
 
         self.cycles_since_flush += 1
 
@@ -287,6 +293,9 @@ class StorageThread(QThread):
         # Called once when recording stops — unlike flush_some(), this
         # drains every queue completely rather than capping rows per
         # cycle, so nothing buffered gets lost at the end of a session.
+        # Same batching approach as flush_some(): collect everything
+        # currently queued for a stream into a list, then one
+        # writerows() call, instead of one writerow() per row.
         while True:
 
             any_written = False
@@ -299,25 +308,29 @@ class StorageThread(QThread):
                     continue
 
                 q = cfg["queue"]
+                batch = []
 
                 try:
                     while True:
-                        row = q.get_nowait()
-
-                        if not self._header_written.get(key, True):
-                            generic_header = [f"col_{i}" for i in range(len(row))]
-                            writer.writerow(generic_header)
-                            self._header_written[key] = True
-
-                        writer.writerow(row)
-                        any_written = True
-
-                        with self._lock:
-                            self._row_counts[key] = self._row_counts.get(key, 0) + 1
+                        batch.append(q.get_nowait())
                 except Empty:
                     pass
                 except Exception as e:
                     print(f"[STORAGE {key} FLUSH_ALL ERROR] {e}")
+
+                if not batch:
+                    continue
+
+                if not self._header_written.get(key, True):
+                    generic_header = [f"col_{i}" for i in range(len(batch[0]))]
+                    writer.writerow(generic_header)
+                    self._header_written[key] = True
+
+                writer.writerows(batch)
+                any_written = True
+
+                with self._lock:
+                    self._row_counts[key] = self._row_counts.get(key, 0) + len(batch)
 
             if not any_written:
                 break

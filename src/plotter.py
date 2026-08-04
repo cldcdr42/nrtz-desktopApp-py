@@ -13,11 +13,13 @@ from pathlib import Path
 import re
 import csv
 
-import matplotlib
-matplotlib.use("Qt5Agg")
-
-import matplotlib.pyplot as plt
-
+# matplotlib is intentionally NOT imported at module level -- it's a
+# heavy import (font cache scan, backend init) that only this module
+# needs, and only when a session is actually plotted. Importing it
+# eagerly here would make every app launch pay that cost, even on
+# runs where "График сохранённого сеанса" is never clicked. It's
+# imported lazily inside plot_session_folder() instead, the first
+# time it's actually needed.
 
 # Keeps a reference to every figure we open so matplotlib doesn't
 # garbage-collect (and silently close) them once plot_session_folder()
@@ -179,6 +181,14 @@ def _filter_by_time(t_values, *y_values, t_min=0.0, t_max=None):
 
 
 def plot_session_folder(session_folder):
+
+    # Lazy import -- see note at top of file. Cheap on repeat calls
+    # (Python caches the module after the first import), so this only
+    # costs anything the first time a session is actually plotted.
+    import matplotlib
+    matplotlib.use("Qt5Agg")
+    import matplotlib.pyplot as plt
+
     session_folder = Path(session_folder)
 
     if not session_folder.exists():
