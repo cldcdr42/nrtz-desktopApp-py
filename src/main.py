@@ -23,7 +23,7 @@ from datetime import datetime
 from utils import data_dir
 import time
 
-from logging_setup import init_logging
+from logging_setup import init_logging, log_print
 init_logging()
 
 from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox, QFileDialog, QDialog
@@ -559,10 +559,18 @@ class MainApp(QMainWindow, GuiMixin):
     # PLOT UPDATE
     # =====================================================
 
+    # Logged only when a single update_plot() call takes long enough to
+    # threaten the 50ms timer interval it runs on -- fires rarely (never,
+    # on a fast machine), so the perf_counter() calls themselves are the
+    # only cost paid on every tick, which is negligible.
+    _PLOT_TICK_WARN_S = 0.03
+
     def update_plot(self):
 
         if not self.recording:
             return
+
+        _t0 = time.perf_counter()
 
         # ---------------- EMG ----------------
         # trim_many() keeps t_emg/v_emg the same length, so under
@@ -626,6 +634,11 @@ class MainApp(QMainWindow, GuiMixin):
 
             except Exception as e:
                 print(f"[PLOT MCU ERROR] {e}")
+
+        _elapsed = time.perf_counter() - _t0
+        if _elapsed > self._PLOT_TICK_WARN_S:
+            log_print(f"[PERF] update_plot took {_elapsed * 1000:.1f} ms "
+                      f"(n_emg={n_emg}, n_mcu={n_mcu})")
 
     # =====================================================
     # STATUS PANEL UPDATE (row counts + connection status)

@@ -10,7 +10,10 @@ writing headers, flushing, and closing them at the end of a session.
 from PyQt5.QtCore import QThread
 from queue import Queue, Empty
 import threading
+import time
 import csv
+
+from logging_setup import log_print
 
 
 class StorageThread(QThread):
@@ -241,7 +244,16 @@ class StorageThread(QThread):
                     self._row_counts.setdefault(key, 0)
                 print(f"[STORAGE] late-opened stream '{key}' -> {cfg['filename']}")
 
+    # Logged only when a single flush_some() cycle takes long enough to
+    # threaten the 10ms sleep between run-loop cycles (see run()) --
+    # fires rarely on a healthy system, so the perf_counter() call
+    # itself is the only cost paid on every cycle, which is negligible.
+    _FLUSH_CYCLE_WARN_S = 0.01
+
     def flush_some(self):
+
+        _t0 = time.perf_counter()
+        _rows_written = 0
 
         for key, cfg in self._snapshot_streams():
 
@@ -279,9 +291,15 @@ class StorageThread(QThread):
                 self._header_written[key] = True
 
             writer.writerows(batch)
+            _rows_written += len(batch)
 
             with self._lock:
                 self._row_counts[key] = self._row_counts.get(key, 0) + len(batch)
+
+        _elapsed = time.perf_counter() - _t0
+        if _elapsed > self._FLUSH_CYCLE_WARN_S:
+            log_print(f"[PERF] flush_some took {_elapsed * 1000:.1f} ms "
+                      f"({_rows_written} rows written)")
 
         self.cycles_since_flush += 1
 
