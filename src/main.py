@@ -118,6 +118,10 @@ class MainApp(QMainWindow, GuiMixin):
         self.lsl_raw_data = LSLStreamWorker(
             label="raw_data", stream_type="Raw_Data",
             start_event=self.start_event, out_queue=self.raw_data_queue,
+            type_fallback_contains="raw",  # catches Raw/RAW/rAw/RawEMG/etc.
+                                            # if the exact "Raw_Data" type
+                                            # string isn't what the
+                                            # publisher actually uses
             plot_hz=0.0,    # logged only, not plotted
         )
         self.lsl_events = LSLStreamWorker(

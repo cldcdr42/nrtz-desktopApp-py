@@ -10,8 +10,9 @@ routing them to CSV storage and (optionally) the live plot.
 
 from PyQt5.QtCore import QThread, pyqtSignal
 from pylsl import resolve_streams, StreamInlet
-import traceback
 import time
+
+from logging_setup import log_print, log_exception
 
 
 class LSLStreamWorker(QThread):
@@ -25,6 +26,16 @@ class LSLStreamWorker(QThread):
     device/vendor, the filter is a heuristic, not a guarantee: if it
     can't cleanly disambiguate, a warning is logged rather than
     silently guessing wrong.
+
+    If the exact `stream_type` match finds nothing, and
+    `type_fallback_contains` is set, a second pass looks for any
+    stream whose 'type' field contains that substring (case-insensitive
+    — so "raw", "Raw", "RAW", "rAw" all match). This exists because the
+    exact type string a publisher uses isn't always guaranteed to match
+    what we expect (e.g. "Raw_Data" vs "RawData" vs "raw"); it's a
+    looser, best-effort match, so every time it's actually used it logs
+    a warning naming what was found, so a wrong guess is visible rather
+    than silent.
 
     Full-rate samples (ALL channels) go directly to `out_queue` for
     CSV saving, as a tuple:
@@ -46,6 +57,8 @@ class LSLStreamWorker(QThread):
         out_queue,
         name_must_contain=None,       # e.g. "raw" -> only match names containing this
         name_must_not_contain=None,   # e.g. "raw" -> exclude names containing this
+        type_fallback_contains=None,  # e.g. "raw" -> if no exact type match, fall back
+                                       # to any stream whose type contains this substring
         plot_hz=0.0,                  # 0 disables the plot signal entirely
         pull_timeout=0.02,
         max_samples=128,
@@ -62,6 +75,9 @@ class LSLStreamWorker(QThread):
         )
         self.name_must_not_contain = (
             name_must_not_contain.lower() if name_must_not_contain else None
+        )
+        self.type_fallback_contains = (
+            type_fallback_contains.lower() if type_fallback_contains else None
         )
 
         self.plot_hz = float(plot_hz)
@@ -82,6 +98,16 @@ class LSLStreamWorker(QThread):
         self.first_lsl_ts = None
 
         self.saved_count = 0
+
+        # Rate-limits the "no matching stream found" log line during
+        # repeated failed reconnect attempts (every ~200ms while
+        # recording and disconnected) -- without this, a stream that
+        # never connects would hit log_print()'s per-line disk flush
+        # 5x/sec for the whole recording, which is exactly the kind of
+        # I/O overhead we don't want on a slow laptop. Logs immediately
+        # on the first failure, then at most once per this interval.
+        self._last_no_match_log_time = 0.0
+        self._no_match_log_interval_s = 5.0
 
     # =====================================================
     # MAIN LOOP
@@ -116,9 +142,9 @@ class LSLStreamWorker(QThread):
                     # stream first connected.
                     try:
                         flushed = self.inlet.flush()
-                        print(f"[LSL:{self.label}] flushed {flushed} old samples")
+                        log_print(f"[LSL:{self.label}] flushed {flushed} old samples")
                     except Exception as e:
-                        print(f"[LSL:{self.label}] flush failed: {e}")
+                        log_print(f"[LSL:{self.label}] flush failed: {e}")
 
                     self.was_recording = True
                     self.first_lsl_ts = None
@@ -144,7 +170,7 @@ class LSLStreamWorker(QThread):
                     # First valid LSL timestamp becomes zero, per-stream.
                     if self.first_lsl_ts is None:
                         self.first_lsl_ts = sample_ts
-                        print(f"[LSL:{self.label}] first_lsl_ts = {self.first_lsl_ts:.6f}")
+                        log_print(f"[LSL:{self.label}] first_lsl_ts = {self.first_lsl_ts:.6f}")
 
                     t_rel = sample_ts - self.first_lsl_ts
 
@@ -176,8 +202,7 @@ class LSLStreamWorker(QThread):
 
             except Exception:
 
-                print(f"[LSL:{self.label} ERROR]")
-                traceback.print_exc()
+                log_exception(f"[LSL:{self.label} ERROR]")
 
                 self.inlet = None
                 self.was_recording = False
@@ -207,37 +232,72 @@ class LSLStreamWorker(QThread):
 
         try:
             streams = resolve_streams()
+            log_print(f"[LSL]Found streams: {streams}")
 
             candidates = [s for s in streams if self._matches(s)]
+            used_fallback = False
+
+            if not candidates and self.type_fallback_contains:
+                # Exact type match found nothing -- try a looser,
+                # case-insensitive substring match against each
+                # stream's type field instead (e.g. a publisher that
+                # calls its stream "RawEMG" or "raw" rather than the
+                # exact "Raw_Data" we normally expect). This is a
+                # best-effort guess, so it's always logged loudly when
+                # it fires, listing exactly what it matched, rather
+                # than silently accepting whatever it finds.
+                candidates = [
+                    s for s in streams
+                    if self.type_fallback_contains in s.type().lower()
+                ]
+                used_fallback = bool(candidates)
 
             if not candidates:
-                print(f"[LSL:{self.label}] no matching stream found "
-                      f"(type={self.stream_type}, "
-                      f"must_contain={self.name_must_contain}, "
-                      f"must_not_contain={self.name_must_not_contain})")
+                now = time.perf_counter()
+                if now - self._last_no_match_log_time >= self._no_match_log_interval_s:
+                    all_types = sorted({s.type() for s in streams})
+                    log_print(
+                        f"[LSL:{self.label}] no matching stream found "
+                        f"(type={self.stream_type}, "
+                        f"must_contain={self.name_must_contain}, "
+                        f"must_not_contain={self.name_must_not_contain}, "
+                        f"fallback_contains={self.type_fallback_contains}). "
+                        f"Types currently on the network: {all_types}"
+                    )
+                    self._last_no_match_log_time = now
                 self.inlet = None
                 return
 
+            if used_fallback:
+                names_types = [(s.name(), s.type()) for s in candidates]
+                log_print(
+                    f"[LSL:{self.label}] WARNING: exact type '{self.stream_type}' not "
+                    f"found — matched via fallback substring "
+                    f"'{self.type_fallback_contains}' instead. Candidates "
+                    f"(name, type): {names_types}. Using the first one: "
+                    f"{names_types[0]}. If this is the wrong stream, fix the "
+                    f"publisher's declared type or narrow the fallback filter."
+                )
+
             if len(candidates) > 1:
                 names = [s.name() for s in candidates]
-                print(f"[LSL:{self.label}] WARNING: {len(candidates)} streams matched "
-                      f"type={self.stream_type} with the same name filter — "
-                      f"disambiguation heuristic failed. Candidates: {names}. "
-                      f"Using the first one: {names[0]}")
+                log_print(f"[LSL:{self.label}] WARNING: {len(candidates)} streams matched "
+                          f"type={self.stream_type} with the same name filter — "
+                          f"disambiguation heuristic failed. Candidates: {names}. "
+                          f"Using the first one: {names[0]}")
 
             stream = candidates[0]
 
             self.inlet = StreamInlet(stream, max_buflen=1, recover=True)
             self.channel_count = stream.channel_count()
 
-            print(f"[LSL:{self.label}] connected to '{stream.name()}' "
-                  f"type={stream.type()} channels={self.channel_count} "
-                  f"srate={stream.nominal_srate()}")
+            log_print(f"[LSL:{self.label}] connected to '{stream.name()}' "
+                      f"type={stream.type()} channels={self.channel_count} "
+                      f"srate={stream.nominal_srate()}")
 
         except Exception:
 
-            print(f"[LSL:{self.label} CONNECT ERROR]")
-            traceback.print_exc()
+            log_exception(f"[LSL:{self.label} CONNECT ERROR]")
             self.inlet = None
 
     def is_connected(self):
@@ -265,7 +325,7 @@ class LSLStreamWorker(QThread):
         self.first_lsl_ts = None
         self.last_plot_emit_time = 0.0
         self.saved_count = 0
-        print(f"[LSL:{self.label}] reset")
+        log_print(f"[LSL:{self.label}] reset")
 
     def stop(self):
         self.running = False
