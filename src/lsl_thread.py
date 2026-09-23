@@ -55,6 +55,7 @@ class LSLStreamWorker(QThread):
         stream_type,
         start_event,
         out_queue,
+        model_queue=None,             # optional: full-rate multi-channel feed for ModelThread
         name_must_contain=None,       # e.g. "raw" -> only match names containing this
         name_must_not_contain=None,   # e.g. "raw" -> exclude names containing this
         type_fallback_contains=None,  # e.g. "raw" -> if no exact type match, fall back
@@ -69,6 +70,7 @@ class LSLStreamWorker(QThread):
         self.stream_type = stream_type
         self.start_event = start_event
         self.out_queue = out_queue
+        self.model_queue = model_queue
 
         self.name_must_contain = (
             name_must_contain.lower() if name_must_contain else None
@@ -186,6 +188,9 @@ class LSLStreamWorker(QThread):
 
                     row = (sample_ts, pc_ts, t_rel) + channels
                     self.out_queue.put(row)
+
+                    if self.model_queue is not None:
+                        self.model_queue.put((t_rel, channels))
 
                     self.saved_count += 1
                     latest_t_rel = t_rel

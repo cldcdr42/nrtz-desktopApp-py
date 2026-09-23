@@ -35,6 +35,7 @@ from lsl_thread import LSLStreamWorker
 from mcu_thread import MCUThread
 from storage_thread import StorageThread
 from udp_sender_thread import UDPSenderThread
+from movement_model import ModelThread
 from plotter import plot_session_folder
 
 import serial.tools.list_ports
@@ -93,6 +94,8 @@ class MainApp(QMainWindow, GuiMixin):
         self.events_queue = Queue()
         self.raw_events_queue = Queue()
         self.mcu_queue = Queue()
+        self.model_emg_queue = Queue()
+        self.model_out_queue = Queue()
 
         # =====================================================
         # BUFFERS
@@ -113,6 +116,7 @@ class MainApp(QMainWindow, GuiMixin):
         self.lsl_data = LSLStreamWorker(
             label="data", stream_type="Data",
             start_event=self.start_event, out_queue=self.data_queue,
+            model_queue=self.model_emg_queue,  # full-rate feed for ModelThread
             plot_hz=50.0,   # this one drives the live EMG plot, as before
         )
         self.lsl_raw_data = LSLStreamWorker(
@@ -161,8 +165,16 @@ class MainApp(QMainWindow, GuiMixin):
         self.storage_thread.register_stream("raw_events", self.raw_events_queue, "raw_events.csv", header=self.lsl_raw_events.header, max_rows_per_cycle=50)
         self.storage_thread.register_stream("mcu",        self.mcu_queue,        "mcu.csv",        header=["pc_perf_counter_s", "mcu_timestamp_us", "angle_raw", "angle_deg", "load_raw", "load_norm"])
 
+        self.model_thread = ModelThread(
+            self.start_event, self.model_emg_queue,
+            out_queue=self.model_out_queue,
+            lsl_worker=self.lsl_data,
+        )
+        self.storage_thread.register_stream("model", self.model_out_queue, "model.csv", header=self.model_thread.header)
+
         self.lsl_data.data.connect(self.on_emg)
         self.mcu_thread.data.connect(self.on_mcu)
+        self.model_thread.output.connect(self.on_model_output)
 
         # UI (built by GuiMixin, defined in gui.py)
         self.init_ui()
@@ -177,6 +189,7 @@ class MainApp(QMainWindow, GuiMixin):
         self.mcu_thread.start()
         self.storage_thread.start()
         self.udp_thread.start()
+        self.model_thread.start()
 
         # plot timer
         self.timer = QTimer()
@@ -421,6 +434,8 @@ class MainApp(QMainWindow, GuiMixin):
         for worker in self.lsl_workers:
             worker.reset_sync()
 
+        self.model_thread.reset_sync()
+
         subject_label = f"{self.name_edit.text()} / {self.session_edit.text()}"
         self.set_recording_ui_state(True, subject_label)
 
@@ -450,7 +465,8 @@ class MainApp(QMainWindow, GuiMixin):
 
         for q in (self.data_queue, self.raw_data_queue,
                   self.events_queue, self.raw_events_queue,
-                  self.mcu_queue):
+                  self.mcu_queue, self.model_emg_queue,
+                  self.model_out_queue):
             while not q.empty():
                 try:
                     q.get_nowait()
@@ -473,6 +489,12 @@ class MainApp(QMainWindow, GuiMixin):
     # DATA HANDLERS
     # =====================================================
 
+    def on_model_output(self, t_rel, rms_list, angle, movement_params):
+        # Placeholder for now -- nothing consumes this yet. Will grow
+        # once there's a live display for it and/or once mcu_thread.py
+        # gains outgoing-command support driven by movement_params.
+        pass
+
     def on_emg(self, t_rel, v):
 
         # -------------------------------------------------
@@ -494,6 +516,8 @@ class MainApp(QMainWindow, GuiMixin):
             return
 
         t_rel = pc_time - self.session_start
+
+        self.model_thread.set_latest_angle(a)
 
         self.mcu_queue.put(
             (
@@ -680,6 +704,7 @@ class MainApp(QMainWindow, GuiMixin):
         self.mcu_thread.stop()
         self.storage_thread.stop()
         self.udp_thread.stop()
+        self.model_thread.stop()
 
         event.accept()
 
