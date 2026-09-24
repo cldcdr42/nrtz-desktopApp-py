@@ -94,6 +94,7 @@ class MainApp(QMainWindow, GuiMixin):
         self.events_queue = Queue()
         self.raw_events_queue = Queue()
         self.mcu_queue = Queue()
+        self.mcu_raw_queue = Queue()
         self.model_emg_queue = Queue()
         self.model_out_queue = Queue()
 
@@ -164,6 +165,7 @@ class MainApp(QMainWindow, GuiMixin):
         self.storage_thread.register_stream("events",     self.events_queue,     "events.csv",     header=self.lsl_events.header, max_rows_per_cycle=50)
         self.storage_thread.register_stream("raw_events", self.raw_events_queue, "raw_events.csv", header=self.lsl_raw_events.header, max_rows_per_cycle=50)
         self.storage_thread.register_stream("mcu",        self.mcu_queue,        "mcu.csv",        header=["pc_perf_counter_s", "mcu_timestamp_us", "angle_raw", "angle_deg", "load_raw", "load_norm"])
+        self.storage_thread.register_stream("mcu_raw",    self.mcu_raw_queue,    "mcu_raw.csv",    header=["relative_time_s", "raw_line"])
 
         self.model_thread = ModelThread(
             self.start_event, self.model_emg_queue,
@@ -174,6 +176,7 @@ class MainApp(QMainWindow, GuiMixin):
 
         self.lsl_data.data.connect(self.on_emg)
         self.mcu_thread.data.connect(self.on_mcu)
+        self.mcu_thread.raw_line.connect(self.on_mcu_raw)
         self.model_thread.output.connect(self.on_model_output)
 
         # UI (built by GuiMixin, defined in gui.py)
@@ -466,7 +469,7 @@ class MainApp(QMainWindow, GuiMixin):
         for q in (self.data_queue, self.raw_data_queue,
                   self.events_queue, self.raw_events_queue,
                   self.mcu_queue, self.model_emg_queue,
-                  self.model_out_queue):
+                  self.model_out_queue, self.mcu_raw_queue):
             while not q.empty():
                 try:
                     q.get_nowait()
@@ -509,6 +512,14 @@ class MainApp(QMainWindow, GuiMixin):
         self.v_emg.append(v)
 
         self.trim_many(self.t_emg, self.v_emg, max_len=5000)
+
+
+    def on_mcu_raw(self, pc_time, line):
+
+        if self.session_start is None:
+            return
+
+        self.mcu_raw_queue.put((pc_time - self.session_start, line))
 
     def on_mcu(self, pc_time, mcu_time_us, angle_raw, a, load_raw, load_norm):
 

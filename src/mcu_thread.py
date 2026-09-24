@@ -32,6 +32,10 @@ class MCUThread(QThread):
     # raw JSON line for UDP forwarding
     raw = pyqtSignal(str)
 
+    # every non-empty serial line, JSON or not, valid or not, with its
+    # PC arrival timestamp -- full-fidelity safety net for mcu_raw.csv
+    raw_line = pyqtSignal(float, str)
+
     def __init__(self, port, baud, start_event, default_span=500000.0):
 
         super().__init__()
@@ -210,6 +214,8 @@ class MCUThread(QThread):
                     continue
 
                 self.raw_count += 1
+
+                self.raw_line.emit(pc_perf_ts, line)
 
                 # Forward raw Arduino JSON to UDP sender
                 if line.startswith("{"):
