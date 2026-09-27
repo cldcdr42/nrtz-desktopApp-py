@@ -25,7 +25,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLineEdit, QTextEdit, QLabel,
-    QGroupBox, QComboBox, QAction, QDialog
+    QGroupBox, QComboBox, QAction, QDialog, QCheckBox
 )
 import pyqtgraph as pg
 
@@ -219,11 +219,33 @@ class GuiMixin:
         self.populate_ports()
 
         # -------------------------------------------------
+        # MOTOR ASSIST GROUP — arms/disarms outgoing motor
+        # commands (mcu_thread.py's motor_enabled flag). Defaults
+        # OFF: nothing is ever written to the serial port unless
+        # this is explicitly checked, regardless of what the
+        # assist model computes or whether recording is active.
+        # -------------------------------------------------
+        self.motor_enable_checkbox = QCheckBox("Разрешить управление мотором")
+        self.motor_enable_checkbox.setChecked(False)
+        self.motor_enable_checkbox.setStyleSheet("color: #c62828; font-weight: bold;")
+        self.motor_enable_checkbox.toggled.connect(self.on_motor_enable_toggled)
+
+        self.assist_status_label = QLabel("Команда мотору: —")
+        self.assist_status_label.setStyleSheet("color: gray;")
+
+        motor_box = QGroupBox("Ассистирующий мотор")
+        motor_layout = QVBoxLayout()
+        motor_layout.addWidget(self.motor_enable_checkbox)
+        motor_layout.addWidget(self.assist_status_label)
+        motor_box.setLayout(motor_layout)
+
+        # -------------------------------------------------
         # RIGHT SIDE
         # -------------------------------------------------
         right_layout = QVBoxLayout()
         right_layout.addWidget(session_box)
         right_layout.addWidget(device_box)
+        right_layout.addWidget(motor_box)
         right_layout.addStretch()
 
         right_widget = QWidget()

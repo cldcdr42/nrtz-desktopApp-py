@@ -492,11 +492,26 @@ class MainApp(QMainWindow, GuiMixin):
     # DATA HANDLERS
     # =====================================================
 
-    def on_model_output(self, t_rel, rms_list, angle, movement_params):
-        # Placeholder for now -- nothing consumes this yet. Will grow
-        # once there's a live display for it and/or once mcu_thread.py
-        # gains outgoing-command support driven by movement_params.
-        pass
+    def on_model_output(self, t_rel, rms_list, angle, velocity, movement_params):
+        """
+        Sends the assist controller's single motor command to the MCU.
+        This ALWAYS enqueues via mcu_thread.send_command() while
+        recording -- what actually reaches the serial port is gated
+        entirely by mcu_thread's own motor_enabled flag (see gui.py's
+        "Разрешить управление мотором" checkbox) and by the assist
+        gate inside MovementModel itself (movement_params[0] is 0.0
+        whenever that gate is closed). Command protocol is a simple
+        placeholder ("M <value>\\n", value in [-1, 1]) -- the MCU
+        firmware needs its own matching parser; nothing in this repo
+        implements that side yet.
+        """
+        if not movement_params:
+            return
+
+        command = movement_params[0]
+        self.mcu_thread.send_command(f"M {command:.3f}")
+
+        self.update_assist_status(command)
 
     def on_emg(self, t_rel, v):
 
@@ -529,6 +544,7 @@ class MainApp(QMainWindow, GuiMixin):
         t_rel = pc_time - self.session_start
 
         self.model_thread.set_latest_angle(a)
+        self.model_thread.set_latest_load(load_norm)
 
         self.mcu_queue.put(
             (
@@ -693,6 +709,22 @@ class MainApp(QMainWindow, GuiMixin):
         lsl_total = len(self.lsl_workers)
 
         self.update_device_status(mcu_connected, lsl_connected_count, lsl_total)
+
+    def update_assist_status(self, command):
+        """Live readout of the last assist command sent (or, while
+        disarmed, the last command computed but never written) -- see
+        gui.py's motor assist group box."""
+        self.assist_status_label.setText(f"Команда мотору: {command:+.3f}")
+
+    def on_motor_enable_toggled(self, checked):
+        """
+        Checkbox callback (gui.py) -- arms/disarms mcu_thread's
+        outgoing serial writes. This is the ONLY thing standing
+        between a computed assist command and the physical motor;
+        everything else (recording, the assist gate) can be active
+        with this left unchecked and nothing will move.
+        """
+        self.mcu_thread.set_motor_enabled(checked)
 
     # =====================================================
     # CLEAN EXIT

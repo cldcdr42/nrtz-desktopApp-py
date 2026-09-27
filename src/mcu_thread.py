@@ -20,6 +20,7 @@ import traceback
 import logging
 import sys
 from pathlib import Path
+from queue import Queue, Empty
 
 from logging_setup import log_print, log_exception
 
@@ -110,6 +111,32 @@ class MCUThread(QThread):
         self.last_debug_report_time = time.monotonic()
         self.last_empty_warning_time = time.monotonic()
 
+        # ----------------------------------------
+        # OUTGOING COMMANDS (motor assist)
+        # ----------------------------------------
+        # Producers (ModelThread's output, via MainApp.on_model_output)
+        # call send_command() from another thread -- it only enqueues.
+        # The actual serial write happens inside run(), on this thread,
+        # same never-touch-self.ser-from-outside-this-thread rule
+        # request_port_change() already follows below.
+        self._command_queue = Queue()
+
+        # Hard safety gate: even with commands queued, nothing is
+        # written to the serial port unless this is explicitly True.
+        # Defaults to False so a fresh app start -- or a bug anywhere
+        # upstream in the assist model -- can never move the motor
+        # without a visible, explicit arm step (see gui.py's motor
+        # enable checkbox). A plain bool, not lock-protected, same as
+        # self._pending_port above: single-value flag, atomic under
+        # the GIL, no correctness need for anything stronger.
+        self.motor_enabled = False
+
+        # Rate-limits the "commands discarded because motor disabled"
+        # log line, same reasoning as _last_no_match_log_time in
+        # lsl_thread.py -- this can otherwise fire at emit_hz forever.
+        self._last_discard_log_time = 0.0
+        self._discard_log_interval_s = 5.0
+
         log_print("[MCU DEBUG] MCUThread created")
         log_print(f"[MCU DEBUG] Initial port={self.port}, baud={self.baud}")
 
@@ -125,6 +152,13 @@ class MCUThread(QThread):
         while self.running:
 
             self._apply_pending_port_change()
+
+            # Drained every iteration, regardless of recording state,
+            # so (a) a disarm/stop command can never be stuck waiting
+            # behind a "not recording" early-continue below, and (b)
+            # commands queued while not recording don't pile up and
+            # then all fire the moment recording starts.
+            self._drain_and_send_commands()
 
             recording = self.start_event.is_set()
 
@@ -403,6 +437,68 @@ class MCUThread(QThread):
             f"pos_span={self.load_span_pos:.0f} (peak={pos_peak}), "
             f"neg_span={self.load_span_neg:.0f} (peak={neg_peak})"
         )
+
+    # =====================================================
+    # OUTGOING COMMANDS (motor assist)
+    # =====================================================
+
+    def set_motor_enabled(self, enabled):
+        """
+        Thread-safe arm/disarm switch for outgoing motor commands,
+        normally driven by a GUI checkbox. While disabled, queued
+        commands are still drained every loop (so nothing piles up
+        and fires the instant it's re-enabled) but never written to
+        the serial port.
+        """
+        self.motor_enabled = bool(enabled)
+        log_print(f"[MCU] Motor output {'ENABLED' if self.motor_enabled else 'DISABLED'}")
+
+    def send_command(self, command):
+        """
+        Thread-safe entry point for queuing an outgoing serial command
+        (e.g. from ModelThread's assist output via
+        MainApp.on_model_output). `command` should be a plain string
+        WITHOUT a trailing newline -- one is added before writing.
+        Only enqueues here; the actual write happens in run(), on
+        this thread, and only while motor_enabled is True.
+        """
+        self._command_queue.put(command)
+
+    def _drain_and_send_commands(self):
+        """
+        Drains every command currently queued (not just one), so
+        commands can never pile up and lag behind if this loop is
+        ever briefly slow. Only actually writes to the serial port if
+        it's open AND motor_enabled is True; otherwise every queued
+        command is discarded (logged at most once per
+        _discard_log_interval_s, not per command -- see reasoning on
+        _last_no_match_log_time in lsl_thread.py).
+        """
+        discarded = 0
+
+        while True:
+            try:
+                command = self._command_queue.get_nowait()
+            except Empty:
+                break
+
+            if not self.motor_enabled or self.ser is None or not self.ser.is_open:
+                discarded += 1
+                continue
+
+            try:
+                self.ser.write((command + "\n").encode("utf-8"))
+            except Exception:
+                log_exception(f"[MCU ERROR] Failed to write outgoing command: {command!r}")
+
+        if discarded and not self.motor_enabled:
+            now = time.perf_counter()
+            if now - self._last_discard_log_time >= self._discard_log_interval_s:
+                log_print(
+                    f"[MCU] Discarded {discarded} outgoing command(s) -- "
+                    f"motor output not enabled"
+                )
+                self._last_discard_log_time = now
 
     # =====================================================
     # LIVE PORT CHANGE (requested from GUI thread)
