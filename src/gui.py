@@ -13,10 +13,10 @@ recording/session logic itself; the methods it calls out to
 (start_recording, populate_ports, show_about, etc.) are implemented
 in main.py.
 
-Also home to LoadCalibrationDialog, the per-trial load-cell
-calibration wizard shown at the start of every recording (see
-main.py's start_recording()): an explicit zero step, followed by a
-two-direction max-pull capture, or a skip-to-defaults path.
+Also home to LoadCalibrationDialog, the optional load-cell
+calibration wizard opened from the "Калибровка" menu item (see
+main.py's open_calibration()): an explicit zero step, followed by a
+two-direction max-pull capture, or a reset-to-defaults path.
 """
 
 from datetime import datetime
@@ -58,6 +58,14 @@ class GuiMixin:
 
     def init_menu(self):
         menubar = self.menuBar()
+
+        # Top-level (single-click) menu item, not a dropdown: opens the
+        # optional load-cell calibration wizard. Kept as an attribute
+        # so set_recording_ui_state() can disable it during recording.
+        self.calibration_action = QAction("Калибровка", self)
+        self.calibration_action.triggered.connect(self.open_calibration)
+        menubar.addAction(self.calibration_action)
+
         help_menu = menubar.addMenu("Справка")
 
         about_action = QAction("О программе", self)
@@ -207,6 +215,7 @@ class GuiMixin:
 
         self.mcu_status_label = QLabel("МК: —")
         self.lsl_status_label = QLabel("LSL: —")
+        self.calibration_status_label = QLabel("Калибровка: —")
 
         device_box = QGroupBox("Устройство")
         device_layout = QVBoxLayout()
@@ -214,6 +223,7 @@ class GuiMixin:
         device_layout.addLayout(port_row)
         device_layout.addWidget(self.mcu_status_label)
         device_layout.addWidget(self.lsl_status_label)
+        device_layout.addWidget(self.calibration_status_label)
         device_box.setLayout(device_layout)
 
         self.populate_ports()
@@ -341,6 +351,7 @@ class GuiMixin:
         self.start_btn.setEnabled(not recording)
         self.stop_btn.setEnabled(recording)
         self.open_folder_btn.setEnabled(not recording)
+        self.calibration_action.setEnabled(not recording)
         self.plot_session_btn.setEnabled(not recording)
         self.port_combo.setEnabled(not recording)
         self.port_refresh_btn.setEnabled(not recording)
@@ -366,26 +377,36 @@ class GuiMixin:
             f"color: {'#2e7d32' if lsl_connected_count == lsl_total else '#c62828'};"
         )
 
+    def set_calibration_status(self, calibrated_at):
+        """calibrated_at: "HH:MM:SS" string of the last calibration, or None for defaults."""
+        if calibrated_at:
+            self.calibration_status_label.setText(f"Калибровка: выполнена в {calibrated_at}")
+            self.calibration_status_label.setStyleSheet("color: #2e7d32;")
+        else:
+            self.calibration_status_label.setText("Калибровка: не выполнена (по умолчанию)")
+            self.calibration_status_label.setStyleSheet("color: #ef6c00;")
+
     def set_saved_to(self, folder):
         self.saved_to_label.setText(f"Сохранено в: {folder}" if folder else "")
 
 
 class LoadCalibrationDialog(QDialog):
     """
-    Per-trial load-cell calibration wizard, run at the start of every
-    recording (the rig gets re-mounted per subject/arm, so this can't
-    be a once-and-saved calibration).
+    Optional load-cell calibration wizard, opened on demand from the
+    "Калибровка" menu item (the rig gets re-mounted per subject/arm,
+    so run it whenever the setup changes). The result stays in effect
+    for every following recording until it is run again or reset.
 
     Flow:
-      choice        -> Calibrate / Use default values / Cancel
+      choice        -> Calibrate / Reset to defaults / Cancel
       zero_wait      -> "hand off the sensor, press SPACE" (Calibrate only)
       zero_capturing -> 5s automatic average of raw values -> zero established
       zero_done      -> shows the zero value, "press SPACE to continue"
       wait1 / cap1   -> direction 1 max-pull capture (existing spacebar-gated flow)
       wait2 / cap2   -> direction 2 max-pull capture
-      done           -> shows both peaks, "press SPACE to start recording"
+      done           -> shows both peaks, "press SPACE to finish"
 
-    "Use default values" skips straight to accept() without touching
+    "Reset to defaults" skips straight to accept() without touching
     load_zero at all — MCUThread's own silent auto-zero (unlocked on
     the way out) picks it up exactly as it did before calibration
     existed.
@@ -422,7 +443,7 @@ class LoadCalibrationDialog(QDialog):
         self.setMinimumWidth(440)
 
         self.instruction_label = QLabel(
-            "Выполнить калибровку датчика нагрузки перед этим сеансом?"
+            "Выполнить калибровку датчика нагрузки?"
         )
         self.instruction_label.setWordWrap(True)
         self.instruction_label.setStyleSheet("font-size: 14px; font-weight: bold;")
@@ -440,7 +461,7 @@ class LoadCalibrationDialog(QDialog):
         # of these via button-focus space-activation.
         # -------------------------------------------------
         self.calibrate_btn = QPushButton("Откалибровать")
-        self.defaults_btn = QPushButton("Значения по умолчанию")
+        self.defaults_btn = QPushButton("Сбросить на значения по умолчанию")
         self.cancel_btn = QPushButton("Отмена")
 
         for btn in (self.calibrate_btn, self.defaults_btn, self.cancel_btn):
@@ -563,7 +584,7 @@ class LoadCalibrationDialog(QDialog):
             # cleanliness/consistency with the other exit paths.
             self.mcu_thread.load_zero_locked = False
             self.instruction_label.setText(
-                "Калибровка завершена. Нажмите ПРОБЕЛ, чтобы начать запись."
+                "Калибровка завершена. Нажмите ПРОБЕЛ, чтобы закрыть окно."
             )
             self.readout_label.setText("")
 

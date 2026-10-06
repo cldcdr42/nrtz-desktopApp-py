@@ -1,27 +1,40 @@
 """
 movement_model.py
 
-Real-time movement-parameter estimator. Runs as its own QThread,
-consuming full-rate EMG samples (from the "Data" LSL stream, which may
-carry more than one EMG channel) and the live MCU angle in parallel,
-and produces one scalar "movement parameter" PER EMG channel -- meant
-to eventually drive a torque command back to the MCU once outgoing-
-command support lands in mcu_thread.py.
+Real-time single-DOF motor-assist controller. Runs as its own QThread,
+consuming full-rate EMG samples (from the "Data" LSL stream) and the
+live MCU angle/load in parallel, and produces ONE motor assist command
+(there is exactly one motor, driving one horizontal-plane forearm DOF).
 
-Current model (deliberately simple, a placeholder meant to be tuned
-or replaced once there's real subject data to look at):
-    - EMG activity = RMS of the EMG signal over a short rolling time
-      window (time-based, not a fixed sample count, so it stays
-      correct even if the LSL stream's actual rate drifts a bit from
-      its nominal rate) -- tracked SEPARATELY for each EMG channel.
-    - The angle acts as a single, global on/off gate shared by every
-      channel (there's only one MCU angle, not one per EMG channel):
-      the model only produces nonzero output once the forearm angle
-      has passed a configured threshold, in a configured direction
-      (e.g. "only assist once the arm is above 30 degrees").
-    - Final output per channel = ReLU(EMG_activity - threshold) while
-      the gate is open, else 0.0. Channels are NOT combined -- each
-      gets its own independent movement parameter.
+Design (velocity-following / admittance-style assistance -- see the
+proof-of-concept discussion this was built from):
+    - Angle is the DOMINANT signal. Angular velocity (derived here
+      from consecutive set_latest_angle() calls, smoothed) drives both
+      the direction and most of the magnitude of the assist command,
+      so the motor follows the direction the forearm is already
+      moving in.
+    - EMG contributes only a SMALL term (K_EMG, ~1-2%). It's tracked
+      per-channel via the existing rolling-RMS infrastructure below,
+      but only the first channel (this rig's one real biceps channel)
+      drives the command. EMG is deliberately kept small both because
+      it's noisy in this single-channel setup and because its main
+      value is speed, not magnitude: EMG onset precedes real movement
+      by roughly 50-150ms (electromechanical delay), so it mostly
+      helps the movement-onset GATE open slightly early.
+    - Load/force is wired through (set_latest_load()) but its gain
+      (K_FORCE) defaults to 0.0 -- flip it once the load calibration
+      is trusted.
+    - A movement-onset gate (velocity OR EMG crossing a threshold,
+      with hysteresis so it doesn't chatter) decides whether the
+      motor should be doing anything at all; outside the gate the
+      command is forced to exactly 0.0.
+    - Output is rate-limited (MAX_COMMAND_SLEW) so motor commands
+      never jump discontinuously between updates.
+
+This is intentionally simple: linear gains, exponential smoothing, a
+hysteresis gate. No ML, no dynamics model. TUNE THE CONSTANTS BELOW
+against real bench data -- with the motor mechanically disconnected --
+before trusting this near a person.
 
 Feeding this thread (see main.py for the actual wiring):
     - EMG samples arrive via a plain Queue (`emg_queue`), as
@@ -31,12 +44,19 @@ Feeding this thread (see main.py for the actual wiring):
       NOT the throttled `data` Qt signal used for the live plot --
       that signal is decimated to plot_hz, single-channel only, and
       would give an inaccurate RMS.
-    - The MCU angle arrives via set_latest_angle(), called directly
-      from the GUI thread's on_mcu() handler. This is a plain
-      lock-protected value, not a Qt signal -- like every other worker
-      thread in this project, ModelThread runs its own while loop
-      rather than a Qt event loop, so a cross-thread queued signal
-      into it would never actually get delivered.
+    - The MCU angle arrives via set_latest_angle(), and load via
+      set_latest_load(), both called directly from the GUI thread's
+      on_mcu() handler. These are plain lock-protected values, not Qt
+      signals -- like every other worker thread in this project,
+      ModelThread runs its own while loop rather than a Qt event
+      loop, so a cross-thread queued signal into it would never
+      actually get delivered.
+    - The resulting assist command reaches the MCU via
+      MainApp.on_model_output() -> mcu_thread.send_command(), gated
+      by mcu_thread's own motor_enabled safety flag (see gui.py's
+      "Разрешить управление мотором" checkbox) -- that flag, not
+      anything in this file, is the final word on whether the motor
+      can physically move.
 """
 
 import time
@@ -51,39 +71,62 @@ from logging_setup import log_print, log_exception
 
 class MovementModel:
     """
-    Pure computation: one rolling-window EMG RMS per channel, combined
-    with a single shared angle gate, into one ReLU'd output per channel.
+    Pure computation: one rolling-window EMG RMS per channel (kept for
+    diagnostics/logging on every channel), combined with angle/velocity
+    (dominant) and load (disabled by default) into ONE motor assist
+    command, via a hysteresis movement-onset gate.
 
     Deliberately isolated from all threading concerns so it can be
     tested or swapped out on its own without touching ModelThread.
     """
 
     # ---------------------------------------------------------------
-    # Defaults -- placeholder values that need real tuning once there's
-    # actual hardware/subject data to look at. Kept as class attributes
-    # (not buried in method bodies) so they're easy to find and adjust
-    # without hunting through the compute logic.
+    # Tunable gains/thresholds -- PLACEHOLDER values. Tune these on the
+    # bench, against real recordings, with the motor mechanically
+    # disconnected, before trusting this near a person. Kept as class
+    # attributes so they're easy to find without hunting through the
+    # compute logic.
     # ---------------------------------------------------------------
-    DEFAULT_WINDOW_MS = 100.0          # RMS window length
-    DEFAULT_EMG_THRESHOLD = 50.0       # raw EMG units -- amplifier/gain dependent
-    DEFAULT_ANGLE_GATE_DEG = 30.0      # gate opens once angle passes this
-    DEFAULT_GATE_DIRECTION = "above"   # "above" or "below"
+    DEFAULT_WINDOW_MS = 100.0            # RMS window length
+
+    K_VELOCITY = 1.0                     # dominant term, applied to normalized velocity
+    K_EMG = 0.02                         # ~1-2% contribution, deliberately small
+    K_FORCE = 0.0                        # disabled until load calibration is trusted
+
+    MAX_EXPECTED_VELOCITY_DEG_S = 150.0  # normalizes velocity to roughly [-1, 1]
+                                          # before gains apply -- set this from the
+                                          # peak angular_velocity in your own recordings
+
+    EMG_REFERENCE_DEFAULT = 50.0         # smoothed |EMG| RMS at a moderate deliberate
+                                          # contraction -- raw amplifier units, MUST be
+                                          # recalibrated per subject/gain (see channel_count()
+                                          # note below); this placeholder normalizes nothing
+                                          # meaningful on its own
+
+    VELOCITY_GATE_DEG_S = 3.0            # angular velocity considered "moving"
+    EMG_GATE = 0.15                      # normalized EMG envelope considered "active"
+    GATE_RELEASE_VELOCITY_DEG_S = 1.0    # hysteresis: lower thresholds release the gate
+    GATE_RELEASE_EMG = 0.08
+
+    MAX_COMMAND = 1.0
+    MAX_COMMAND_SLEW = 0.15              # max change in command per compute() call
+
+    # Optional hard safety clamp -- if set, command is forced to 0.0
+    # outside this angle range regardless of everything else. None
+    # (the default) disables the clamp entirely.
+    ANGLE_SAFETY_MIN_DEG = None
+    ANGLE_SAFETY_MAX_DEG = None
 
     def __init__(
         self,
         window_ms=None,
-        emg_threshold=None,
-        angle_gate_deg=None,
-        gate_direction=None,
+        emg_reference=None,
     ):
         self.window_s = (window_ms if window_ms is not None else self.DEFAULT_WINDOW_MS) / 1000.0
-        self.emg_threshold = emg_threshold if emg_threshold is not None else self.DEFAULT_EMG_THRESHOLD
-        self.angle_gate_deg = angle_gate_deg if angle_gate_deg is not None else self.DEFAULT_ANGLE_GATE_DEG
-
-        self.gate_direction = (gate_direction or self.DEFAULT_GATE_DIRECTION).lower()
-        if self.gate_direction not in ("above", "below"):
-            log_print(f"[MODEL] Unknown gate_direction '{self.gate_direction}', defaulting to 'above'")
-            self.gate_direction = "above"
+        self.emg_reference = max(
+            emg_reference if emg_reference is not None else self.EMG_REFERENCE_DEFAULT,
+            1e-6,
+        )
 
         # One rolling window (deque of (t_rel, value)) and one running
         # sum-of-squares per EMG channel, so RMS is O(1) per incoming
@@ -94,9 +137,15 @@ class MovementModel:
         # Channel count isn't known until the first sample arrives
         # (same reasoning as LSLStreamWorker only knowing its own
         # channel_count after connect()), so these start empty and are
-        # lazily sized on the first push_emg_sample() call.
+        # lazily sized on the first push_emg_sample() call. Only
+        # channel 0 (this rig's one real biceps channel) drives the
+        # assist command below -- any others are tracked for logging
+        # only.
         self._buffers = None   # list[deque] once sized
         self._sumsq = None     # list[float] once sized
+
+        self._gated_on = False
+        self._prev_command = 0.0
 
     # =====================================================
     # EMG WINDOW
@@ -159,38 +208,90 @@ class MovementModel:
         return len(self._buffers) if self._buffers else 0
 
     def reset(self):
-        """Clears all rolling windows -- called between recordings so a
-        stale window from the previous session can't bleed into the next.
-        Channel count is rediscovered from scratch on the next sample."""
+        """Clears all rolling windows plus gate/command state -- called
+        between recordings so nothing from the previous session bleeds
+        into the next. Channel count is rediscovered from scratch on
+        the next sample."""
         self._buffers = None
         self._sumsq = None
+        self._gated_on = False
+        self._prev_command = 0.0
 
     # =====================================================
     # GATE + OUTPUT
     # =====================================================
 
-    def gate_open(self, angle_deg):
-        if self.gate_direction == "above":
-            return angle_deg >= self.angle_gate_deg
-        return angle_deg <= self.angle_gate_deg
-
-    def compute(self, angle_deg):
+    def _gate_open(self, velocity_deg_s, emg_norm):
         """
-        Combines each channel's current EMG RMS (over its rolling
-        window, already fed via push_emg_sample) with the single
-        shared angle gate into one movement parameter PER channel.
+        Movement-onset gate with hysteresis: opens on EITHER a real
+        angular velocity OR an EMG spike (whichever fires first --
+        EMG typically leads by ~50-150ms), and only closes once BOTH
+        drop below their (lower) release thresholds, so it doesn't
+        chatter on/off right at the boundary.
+        """
+        moving = (
+            abs(velocity_deg_s) > self.VELOCITY_GATE_DEG_S
+            or emg_norm > self.EMG_GATE
+        )
+        releasing = (
+            abs(velocity_deg_s) < self.GATE_RELEASE_VELOCITY_DEG_S
+            and emg_norm < self.GATE_RELEASE_EMG
+        )
 
-        Returns (rms_list, movement_param_list), same length, in
-        channel order, so the caller can log/plot raw activity
-        alongside the gated output for every channel.
+        if not self._gated_on and moving:
+            self._gated_on = True
+        elif self._gated_on and releasing:
+            self._gated_on = False
+
+        return self._gated_on
+
+    def compute(self, angle_deg, velocity_deg_s, load_norm=None):
+        """
+        Combines the primary (channel 0) EMG RMS with angle/velocity
+        (dominant) and load (disabled by default, via K_FORCE) into
+        ONE motor assist command -- there is exactly one motor.
+
+        Returns (rms_list, movement_params) for compatibility with
+        ModelThread/StorageThread: rms_list still has one entry per
+        EMG channel (diagnostics), but movement_params is now a
+        SINGLE-element list [assist_command], not one per channel.
         """
         rms_list = self.emg_rms()
+        emg_rms_primary = rms_list[0] if rms_list else 0.0
+        emg_norm = min(1.0, emg_rms_primary / self.emg_reference)
 
-        if not self.gate_open(angle_deg):
-            return rms_list, [0.0 for _ in rms_list]
+        gate_open = self._gate_open(velocity_deg_s, emg_norm)
 
-        movement_params = [max(0.0, rms - self.emg_threshold) for rms in rms_list]
-        return rms_list, movement_params
+        safety_blocked = (
+            (self.ANGLE_SAFETY_MIN_DEG is not None and angle_deg < self.ANGLE_SAFETY_MIN_DEG)
+            or (self.ANGLE_SAFETY_MAX_DEG is not None and angle_deg > self.ANGLE_SAFETY_MAX_DEG)
+        )
+
+        if not gate_open or safety_blocked:
+            command = 0.0
+        else:
+            velocity_norm = velocity_deg_s / self.MAX_EXPECTED_VELOCITY_DEG_S
+            direction = 1.0 if velocity_deg_s >= 0 else -1.0
+
+            force_term = 0.0
+            if load_norm is not None and self.K_FORCE != 0.0:
+                force_term = self.K_FORCE * load_norm
+
+            command = (
+                self.K_VELOCITY * velocity_norm
+                + self.K_EMG * emg_norm * direction
+                + force_term
+            )
+            command = max(-self.MAX_COMMAND, min(self.MAX_COMMAND, command))
+
+        # Rate-limit so the command sent to the motor never jumps
+        # discontinuously between successive compute() calls.
+        delta = command - self._prev_command
+        delta = max(-self.MAX_COMMAND_SLEW, min(self.MAX_COMMAND_SLEW, delta))
+        command = self._prev_command + delta
+        self._prev_command = command
+
+        return rms_list, [command]
 
 
 class ModelThread(QThread):
@@ -207,13 +308,16 @@ class ModelThread(QThread):
     needs to react that fast.
     """
 
-    # t_rel, emg_rms_list (object: list[float]), angle_deg, movement_param_list (object: list[float])
+    # t_rel, emg_rms_list (object: list[float]), angle_deg,
+    # angular_velocity_deg_s, movement_param_list (object: [assist_command])
     #
-    # Fixed-arity float args won't work here since the channel count
-    # isn't known until runtime -- 'object' lets the signal carry a
-    # plain Python list of whatever length the stream turns out to
-    # have, same idea PyQt uses for any variable-shaped payload.
-    output = pyqtSignal(float, object, float, object)
+    # Fixed-arity float args won't work for the EMG list since the
+    # channel count isn't known until runtime -- 'object' lets the
+    # signal carry a plain Python list of whatever length the stream
+    # turns out to have, same idea PyQt uses for any variable-shaped
+    # payload. movement_param_list is always length 1 now (one motor),
+    # kept as a list for wire-format compatibility with header()/CSV.
+    output = pyqtSignal(float, object, float, float, object)
 
     def __init__(
         self,
@@ -252,25 +356,59 @@ class ModelThread(QThread):
         self.was_recording = False
         self.last_emit_time = 0.0
 
-        # Latest angle, set from the GUI thread's on_mcu() handler.
-        # Plain lock rather than a Qt signal -- see module docstring.
-        self._angle_lock = threading.Lock()
+        # Latest angle/velocity/load, set from the GUI thread's
+        # on_mcu() handler. Plain lock rather than a Qt signal -- see
+        # module docstring. Velocity is derived HERE, from consecutive
+        # set_latest_angle() calls, since angle is the only signal in
+        # this thread with a reliable per-sample timestamp available
+        # at the point it arrives (EMG samples don't map 1:1 to angle
+        # samples in real time -- different rates, different queues).
+        self._state_lock = threading.Lock()
         self._latest_angle = 0.0
+        self._latest_load = None
+        self._velocity_smooth = 0.0
+        self._prev_angle_for_velocity = None
+        self._prev_angle_time = None
 
         log_print("[MODEL] ModelThread created")
+
+    VELOCITY_SMOOTHING_ALPHA = 0.35  # EMA smoothing for the derived angular velocity
 
     # =====================================================
     # EXTERNAL INPUT (called from other threads)
     # =====================================================
 
     def set_latest_angle(self, angle_deg):
-        """Thread-safe setter, called from the GUI thread's on_mcu()."""
-        with self._angle_lock:
+        """
+        Thread-safe setter, called from the GUI thread's on_mcu()
+        handler once per MCU sample (~10 Hz). Also derives a smoothed
+        angular velocity (deg/s) from consecutive calls -- see the
+        note in __init__ on why velocity is computed here rather than
+        passed in.
+        """
+        now = time.perf_counter()
+
+        with self._state_lock:
+
+            if self._prev_angle_time is not None:
+                dt = now - self._prev_angle_time
+                if dt > 0:
+                    raw_velocity = (angle_deg - self._prev_angle_for_velocity) / dt
+                    a = self.VELOCITY_SMOOTHING_ALPHA
+                    self._velocity_smooth = a * raw_velocity + (1 - a) * self._velocity_smooth
+
+            self._prev_angle_for_velocity = angle_deg
+            self._prev_angle_time = now
             self._latest_angle = angle_deg
 
-    def _get_latest_angle(self):
-        with self._angle_lock:
-            return self._latest_angle
+    def set_latest_load(self, load_norm):
+        """Thread-safe setter, called from the GUI thread's on_mcu() handler."""
+        with self._state_lock:
+            self._latest_load = load_norm
+
+    def _get_latest_state(self):
+        with self._state_lock:
+            return self._latest_angle, self._velocity_smooth, self._latest_load
 
     # =====================================================
     # MAIN LOOP
@@ -305,8 +443,7 @@ class ModelThread(QThread):
                 # -------------------------------------------------
                 if not self.was_recording:
                     self._drain_queue()
-                    self.model.reset()
-                    self.last_emit_time = 0.0
+                    self.reset_sync()
                     self.was_recording = True
                     log_print("[MODEL] Recording started -- windows reset")
 
@@ -327,13 +464,13 @@ class ModelThread(QThread):
                         continue
                     self.last_emit_time = now
 
-                angle = self._get_latest_angle()
-                rms_list, movement_params = self.model.compute(angle)
+                angle, velocity, load = self._get_latest_state()
+                rms_list, movement_params = self.model.compute(angle, velocity, load)
 
-                self.output.emit(t_rel, rms_list, angle, movement_params)
+                self.output.emit(t_rel, rms_list, angle, velocity, movement_params)
 
                 if self.out_queue is not None:
-                    self.out_queue.put((t_rel, *rms_list, angle, *movement_params))
+                    self.out_queue.put((t_rel, *rms_list, angle, velocity, *movement_params))
 
             except Exception:
                 log_exception("[MODEL ERROR] Unexpected exception in ModelThread")
@@ -365,8 +502,7 @@ class ModelThread(QThread):
 
         cols = ["relative_time_s"]
         cols += [f"emg_rms_ch{i}" for i in range(n)]
-        cols += ["angle_deg"]
-        cols += [f"movement_param_ch{i}" for i in range(n)]
+        cols += ["angle_deg", "angular_velocity_deg_s", "assist_command"]
         return cols
 
     # =====================================================
@@ -378,6 +514,10 @@ class ModelThread(QThread):
         self.model.reset()
         self.last_emit_time = 0.0
         self.was_recording = False
+        with self._state_lock:
+            self._velocity_smooth = 0.0
+            self._prev_angle_for_velocity = None
+            self._prev_angle_time = None
         log_print("[MODEL] reset_sync() called")
 
     # =====================================================

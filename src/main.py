@@ -6,9 +6,11 @@ all the acquisition threads (LSL streams, MCU serial, UDP forwarding,
 CSV storage), owns the live plot, and handles session start/stop and
 recording-session bookkeeping (session folder, session_info.txt).
 
-Every recording starts with a per-trial load-cell calibration step
-(LoadCalibrationDialog, gui.py) before the real session/timer/CSV
-writing begins — see start_recording() below.
+Load-cell calibration is optional: the operator runs it on demand from
+the "Калибровка" menu item (open_calibration() below, using
+LoadCalibrationDialog from gui.py). Pressing Start never opens it; a
+recording just uses the latest calibration, or default values plus
+MCUThread's silent auto-zero if none has been run.
 
 GUI layout/widget construction lives in gui.py (GuiMixin) — this file
 owns thread wiring, recording control, and data handling only.
@@ -60,9 +62,13 @@ class MainApp(QMainWindow, GuiMixin):
 
         self.window_size = 10
 
-        # Set by the calibration dialog in start_recording(), before
-        # create_session() writes them into session_info.txt.
-        self._last_calibration_skipped = False
+        # Set by open_calibration() whenever the operator runs the
+        # calibration dialog; persists across recordings until it is
+        # run again. create_session() writes them into
+        # session_info.txt. True = "no calibration, default values"
+        # (also the state before any calibration has been run).
+        self._last_calibration_skipped = True
+        self._last_calibration_time = None  # "HH:MM:SS" of last real calibration
         self._last_zero = None
         self._last_peak_pos = None
         self._last_peak_neg = None
@@ -233,6 +239,80 @@ class MainApp(QMainWindow, GuiMixin):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    def open_calibration(self):
+        """
+        Optional load-cell calibration, triggered from the menu bar.
+        Never called automatically by start_recording(). The result
+        (zero + spans on mcu_thread, plus the _last_* values written to
+        session_info.txt) stays in effect for all later recordings.
+        """
+
+        if self.recording:
+            return
+
+        if not self.mcu_thread.is_connected():
+            QMessageBox.warning(
+                self,
+                "Калибровка",
+                "MCU не подключён — калибровка невозможна.\n"
+                "Проверьте COM-порт и повторите попытку."
+            )
+            return
+
+        # The dialog wipes load_zero when it opens, so remember the
+        # current calibration to restore it if the operator cancels.
+        prev_zero = self.mcu_thread.load_zero
+        prev_span_pos = self.mcu_thread.load_span_pos
+        prev_span_neg = self.mcu_thread.load_span_neg
+
+        # MCU/LSL threads only read while start_event is set, and the
+        # dialog needs live raw values. self.recording stays False, so
+        # StorageThread never opens or writes any files.
+        self.reset_buffers()
+        self.start_event.set()
+
+        calibration = LoadCalibrationDialog(self.mcu_thread, parent=self)
+        result = calibration.exec_()
+
+        self.start_event.clear()
+
+        try:
+            self.mcu_thread.data.disconnect(calibration._on_data)
+        except Exception:
+            pass
+        calibration.deleteLater()
+
+        # Whatever accumulated while the dialog was open is not trial data.
+        self.reset_buffers()
+
+        if result != QDialog.Accepted:
+            self.mcu_thread.load_zero = prev_zero
+            self.mcu_thread.load_span_pos = prev_span_pos
+            self.mcu_thread.load_span_neg = prev_span_neg
+            print("[CALIBRATION] cancelled, previous calibration kept")
+            return
+
+        pos_peak, neg_peak = calibration.get_calibration()
+        self.mcu_thread.set_load_calibration(pos_peak, neg_peak)
+
+        self._last_calibration_skipped = calibration.calibration_skipped
+        self._last_calibration_time = (
+            None if calibration.calibration_skipped
+            else datetime.now().strftime("%H:%M:%S")
+        )
+        self._last_zero = calibration.zero_value
+        self._last_peak_pos = pos_peak
+        self._last_peak_neg = neg_peak
+        # Read the *applied* spans back from mcu_thread rather than
+        # recomputing the 2x headroom here — single source of truth
+        # for what's actually used during normalization.
+        self._last_span_pos = self.mcu_thread.load_span_pos
+        self._last_span_neg = self.mcu_thread.load_span_neg
+
+        self.set_calibration_status(self._last_calibration_time)
+
+        print("[CALIBRATION] done" + (" (reset to defaults)" if calibration.calibration_skipped else ""))
+
     # =====================================================
     # SESSION
     # =====================================================
@@ -268,6 +348,7 @@ class MainApp(QMainWindow, GuiMixin):
             else:
                 f.write(
                     f"Калибровка нагрузки:\n"
+                    f"  Время калибровки: {self._last_calibration_time}\n"
                     f"  Ноль: {self._last_zero:.0f}\n"
                     f"  Макс. усилие, направление 1 (пик): "
                     f"{self._last_peak_pos if self._last_peak_pos is not None else 'н/д'}\n"
@@ -372,40 +453,10 @@ class MainApp(QMainWindow, GuiMixin):
 
         self.reset_buffers()
 
-        # -------------------------------------------------
-        # Let MCU/LSL threads start actively reading/emitting so the
-        # calibration dialog can show live raw values — but hold off
-        # on self.recording=True (and therefore on StorageThread
-        # actually opening/writing files) until the dialog is
-        # resolved one way or another.
-        # -------------------------------------------------
+        # Calibration is optional and done beforehand from the menu
+        # (open_calibration()); here we just let the MCU/LSL threads
+        # start reading and use whatever calibration is current.
         self.start_event.set()
-
-        calibration = LoadCalibrationDialog(self.mcu_thread, parent=self)
-        result = calibration.exec_()
-
-        if result != QDialog.Accepted:
-            # Operator hit Cancel or Esc -> abort start entirely.
-            self.start_event.clear()
-            print("[START] cancelled at calibration dialog")
-            return
-
-        pos_peak, neg_peak = calibration.get_calibration()
-        self.mcu_thread.set_load_calibration(pos_peak, neg_peak)
-
-        self._last_calibration_skipped = calibration.calibration_skipped
-        self._last_zero = calibration.zero_value
-        self._last_peak_pos = pos_peak
-        self._last_peak_neg = neg_peak
-        # Read the *applied* spans back from mcu_thread rather than
-        # recomputing the 2x headroom here — single source of truth
-        # for what's actually used during normalization.
-        self._last_span_pos = self.mcu_thread.load_span_pos
-        self._last_span_neg = self.mcu_thread.load_span_neg
-
-        # Discard whatever samples accumulated during the dialog —
-        # that data was never meant to be part of the saved trial.
-        self.reset_buffers()
 
         # IMPORTANT:
         # real samples define session zero
@@ -426,13 +477,13 @@ class MainApp(QMainWindow, GuiMixin):
 
         self.recording = True
 
-        # reset_zero=False: the zero baseline was just established
-        # (explicitly by calibration, or intentionally left for
-        # MCUThread's own auto-zero if defaults were chosen) — don't
-        # let this wipe it. Everything else (was_recording, debug
-        # counters) still resets normally.
+        # If a calibration was run from the menu, keep its zero
+        # (reset_zero=False). Otherwise (never calibrated, or reset to
+        # defaults) clear it so MCUThread's silent auto-zero
+        # re-establishes the baseline at the start of each recording.
+        # Everything else (was_recording, debug counters) resets normally.
         if hasattr(self.mcu_thread, "reset_sync"):
-            self.mcu_thread.reset_sync(reset_zero=False)
+            self.mcu_thread.reset_sync(reset_zero=self._last_calibration_skipped)
 
         for worker in self.lsl_workers:
             worker.reset_sync()
@@ -709,6 +760,7 @@ class MainApp(QMainWindow, GuiMixin):
         lsl_total = len(self.lsl_workers)
 
         self.update_device_status(mcu_connected, lsl_connected_count, lsl_total)
+        self.set_calibration_status(self._last_calibration_time)
 
     def update_assist_status(self, command):
         """Live readout of the last assist command sent (or, while
